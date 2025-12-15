@@ -2,9 +2,9 @@
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 
-// 🔥 CONFIGURACIÓN SUPABASE CON TU SECRET KEY REAL
-const SUPABASE_URL = "https://rrqxllucpihrcxeaossl.supabase.co";
-const SUPABASE_SERVICE_KEY = "sb_secret_2f8kVfmJIe4GlUZ1WMyITQ_CBttbzsa";
+// ✅ CORRECTO - Usa variables de entorno
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://rrqxllucpihrcxeaossl.supabase.co";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
 // Inicializar Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
