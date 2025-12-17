@@ -1,4 +1,4 @@
-// server/server_index.js - VERSIÓN MEJORADA CON CÁLCULO PRECISO
+// server_index.js - VERSIÓN COMPLETA CON SISTEMA SIMPLE POR SSID/WIFI
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -15,8 +15,8 @@ const PORT = process.env.PORT || 3000;
 // Tiempo de espera para considerar OFFLINE (5 segundos)
 const ONLINE_TIMEOUT_MS = 5000;
 
-// 🔥 ESTRUCTURA MEJORADA: Más datos para cálculo preciso
-const onlineDevices = {}; // { deviceId: { lastSeen, lastPower, energy, lastTs, calculationData, ... } }
+// 🔥 ESTRUCTURA MEJORADA CON SSID
+const onlineDevices = {}; // { deviceId: { lastSeen, lastPower, energy, lastTs, wifiSsid, networkCode, ... } }
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -33,6 +33,21 @@ app.use((req, res, next) => {
 });
 
 // ====== FUNCIONES AUXILIARES MEJORADAS ======
+
+// 🔥 FUNCIÓN: Generar código de red simple
+const generateNetworkCode = (ssid) => {
+  if (!ssid || typeof ssid !== 'string') return null;
+  
+  // Toma las primeras 4 letras del SSID (sin espacios)
+  const cleanSsid = ssid.replace(/\s+/g, '');
+  const prefix = cleanSsid.substring(0, Math.min(4, cleanSsid.length)).toUpperCase();
+  
+  // Si el SSID es muy corto, usa "WIFI"
+  const finalPrefix = prefix || 'WIFI';
+  const randomNum = Math.floor(1000 + Math.random() * 9000);
+  
+  return `${finalPrefix}${randomNum}`; // Ej: "CASA5678"
+};
 
 // 🔥 FUNCIÓN MEJORADA: Cálculo de energía MUCHO más preciso
 const calculateEnergyAccumulated = (prevState, currentPower, currentTime) => {
@@ -68,9 +83,11 @@ const calculateEnergyAccumulated = (prevState, currentPower, currentTime) => {
   return newEnergy;
 };
 
-// 🔥 NUEVA FUNCIÓN: Inicializar dispositivo con estructura mejorada
-const initializeDeviceState = (deviceId, deviceInDb) => {
+// 🔥 NUEVA FUNCIÓN: Inicializar dispositivo con SSID
+const initializeDeviceState = (deviceId, deviceInDb, wifiSsid = null) => {
   if (!onlineDevices[deviceId]) {
+    const networkCode = wifiSsid ? generateNetworkCode(wifiSsid) : null;
+    
     onlineDevices[deviceId] = {
       lastSeen: Date.now(),
       lastTs: Date.now(),
@@ -78,6 +95,8 @@ const initializeDeviceState = (deviceId, deviceInDb) => {
       energy: deviceInDb?.energy || 0,
       userId: deviceInDb?.user_id,
       deviceDbId: deviceInDb?.id,
+      wifiSsid: wifiSsid || deviceInDb?.wifi_ssid,
+      networkCode: networkCode || deviceInDb?.network_code,
       totalCalculations: 0,
       lastData: {
         voltage: 0,
@@ -93,6 +112,13 @@ const initializeDeviceState = (deviceId, deviceInDb) => {
       },
     };
   }
+  
+  // Actualizar SSID si es nuevo
+  if (wifiSsid && !onlineDevices[deviceId].wifiSsid) {
+    onlineDevices[deviceId].wifiSsid = wifiSsid;
+    onlineDevices[deviceId].networkCode = generateNetworkCode(wifiSsid);
+  }
+  
   return onlineDevices[deviceId];
 };
 
@@ -123,6 +149,30 @@ async function findDeviceByEsp32Id(esp32Id) {
   } catch (e) {
     console.warn("⚠️ findDeviceByEsp32Id exception:", e.message);
     return null;
+  }
+}
+
+// 🔥 NUEVA: Buscar dispositivos por SSID
+async function findDevicesByWifiSsid(wifiSsid) {
+  try {
+    if (!wifiSsid || typeof wifiSsid !== "string") {
+      return [];
+    }
+
+    const { data, error } = await supabase
+      .from("devices")
+      .select("*")
+      .eq("wifi_ssid", wifiSsid.trim());
+
+    if (error) {
+      console.warn("⚠️ findDevicesByWifiSsid error:", error.message);
+      return [];
+    }
+
+    return data || [];
+  } catch (e) {
+    console.warn("⚠️ findDevicesByWifiSsid exception:", e.message);
+    return [];
   }
 }
 
@@ -202,13 +252,14 @@ async function cleanupOnlineStatus() {
   }
 }
 
-// ====== ENDPOINTS MEJORADOS ======
+// ====== ENDPOINTS MEJORADOS CON SSID ======
 
-// 📍 ENDPOINT: Recibir datos de ESP32 - VERSIÓN MEJORADA
+// 📍 ENDPOINT: Recibir datos de ESP32 - CON SSID
 app.post("/api/data", async (req, res) => {
   try {
     const {
       deviceId,
+      wifiSsid,  // 🔥 NUEVO: Recibir el SSID del ESP32
       voltage,
       current,
       power,
@@ -237,8 +288,8 @@ app.post("/api/data", async (req, res) => {
     const userId = deviceInDb?.user_id;
     const deviceDbId = deviceInDb?.id;
 
-    // 🔥 INICIALIZAR O ACTUALIZAR ESTADO DEL DISPOSITIVO
-    const deviceState = initializeDeviceState(deviceId, deviceInDb);
+    // 🔥 INICIALIZAR O ACTUALIZAR ESTADO DEL DISPOSITIVO CON SSID
+    const deviceState = initializeDeviceState(deviceId, deviceInDb, wifiSsid);
 
     // 🔥 CÁLCULO PRECISO DE ENERGÍA ACUMULADA
     const finalEnergy = calculateEnergyAccumulated(
@@ -247,7 +298,7 @@ app.post("/api/data", async (req, res) => {
       now
     );
 
-    // 🔥 ACTUALIZAR CACHE EN MEMORIA CON MÁS PRECISIÓN
+    // 🔥 ACTUALIZAR CACHE EN MEMORIA
     onlineDevices[deviceId] = {
       ...deviceState,
       lastSeen: now,
@@ -256,6 +307,7 @@ app.post("/api/data", async (req, res) => {
       energy: finalEnergy,
       userId: userId,
       deviceDbId: deviceDbId,
+      wifiSsid: wifiSsid || deviceState.wifiSsid,
       totalCalculations: (deviceState.totalCalculations || 0) + 1,
       lastData: {
         voltage: data.voltage,
@@ -265,38 +317,43 @@ app.post("/api/data", async (req, res) => {
       },
     };
 
-    // 🔥 SI ESTÁ REGISTRADO, ACTUALIZAR EN SUPABASE CON MÁS PRECISIÓN
+    // 🔥 SI ESTÁ REGISTRADO, ACTUALIZAR EN SUPABASE CON SSID
     if (isRegistered && deviceDbId) {
-      await updateDeviceInSupabase(deviceDbId, {
+      const updates = {
         is_online: true,
         last_seen: new Date().toISOString(),
         power: data.power,
-        energy: finalEnergy, // 🔥 ENERGÍA CALCULADA PRECISAMENTE
+        energy: finalEnergy,
         voltage: data.voltage,
         current: data.current,
         frequency: data.frequency,
         power_factor: data.powerFactor,
-        // 🔥 NUEVO: Guardar energía total para consistencia
         total_energy: finalEnergy,
-      });
+      };
+      
+      // 🔥 ACTUALIZAR SSID si es diferente
+      if (wifiSsid && wifiSsid !== deviceInDb.wifi_ssid) {
+        updates.wifi_ssid = wifiSsid;
+        updates.network_code = generateNetworkCode(wifiSsid);
+      }
+      
+      await updateDeviceInSupabase(deviceDbId, updates);
     }
 
-    // 🔥 LOG MEJORADO: Mostrar más decimales y información
+    // 🔥 LOG MEJORADO CON SSID
     console.log(
       `[DATA] ${deviceId} → ` +
-        `V:${data.voltage.toFixed(1)}V  I:${data.current.toFixed(
-          3
-        )}A  P:${data.power.toFixed(1)}W  ` +
-        `E:${finalEnergy.toFixed(6)}kWh  F:${data.frequency.toFixed(
-          1
-        )}Hz  PF:${data.powerFactor.toFixed(2)} ` +
-        `| ${isRegistered ? "✅ REGISTRADO" : "⚠️ NO REGISTRADO"}`
+      `WiFi: "${wifiSsid || 'No SSID'}" | ` +
+      `V:${data.voltage.toFixed(1)}V  I:${data.current.toFixed(3)}A  ` +
+      `P:${data.power.toFixed(1)}W  E:${finalEnergy.toFixed(6)}kWh  ` +
+      `| ${isRegistered ? "✅ REGISTRADO" : "⚠️ NO REGISTRADO"}`
     );
 
     res.json({
       ok: true,
       registered: isRegistered,
       calculatedEnergy: finalEnergy,
+      wifiSsid: wifiSsid,
       timestamp: now,
     });
   } catch (e) {
@@ -305,7 +362,240 @@ app.post("/api/data", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT: Registrar dispositivo - VERSIÓN MEJORADA
+// 📍 ENDPOINT: Buscar dispositivos por nombre de WiFi (SISTEMA SIMPLE)
+app.get("/api/devices-by-wifi", async (req, res) => {
+  try {
+    const { wifiName } = req.query;
+    
+    if (!wifiName) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Por favor, escribe el nombre de tu WiFi" 
+      });
+    }
+
+    const cleanWifiName = wifiName.trim();
+    
+    console.log(`🔍 [WIFI-SEARCH] Buscando dispositivos en WiFi: "${cleanWifiName}"`);
+
+    // 🔥 Buscar en dispositivos registrados en Supabase
+    const registeredDevices = await findDevicesByWifiSsid(cleanWifiName);
+
+    // 🔥 Buscar dispositivos NO registrados que estén en ese WiFi (en cache)
+    const now = Date.now();
+    const unregisteredDevices = Object.entries(onlineDevices)
+      .filter(([deviceId, state]) => {
+        return (
+          now - state.lastSeen < ONLINE_TIMEOUT_MS &&
+          state.wifiSsid === cleanWifiName &&
+          !state.userId // Solo no registrados
+        );
+      })
+      .map(([deviceId, state]) => ({
+        deviceId: deviceId,
+        esp32_id: deviceId,
+        name: `Dispositivo ${deviceId.substring(0, 8)}`,
+        is_online: true,
+        wifi_ssid: state.wifiSsid,
+        network_code: state.networkCode,
+        is_temporary: true, // Indica que no está registrado aún
+        power: state.lastPower || 0,
+        voltage: state.lastData?.voltage || 0,
+        current: state.lastData?.current || 0,
+        energy: state.energy || 0,
+        status: "online",
+        last_seen: new Date(state.lastSeen).toISOString(),
+      }));
+
+    // Combinar resultados
+    const allDevices = [
+      ...registeredDevices.map(device => ({
+        ...device,
+        is_temporary: false,
+        status: device.is_online ? "online" : "offline"
+      })),
+      ...unregisteredDevices
+    ];
+
+    console.log(`✅ [WIFI-SEARCH] "${cleanWifiName}" → ${allDevices.length} dispositivos encontrados`);
+    
+    res.json({
+      success: true,
+      wifiName: cleanWifiName,
+      devices: allDevices,
+      count: allDevices.length,
+      message: allDevices.length === 0 
+        ? "No hay dispositivos conectados a este WiFi. Verifica el nombre."
+        : `Encontré ${allDevices.length} dispositivo(s)`
+    });
+
+  } catch (e) {
+    console.error("💥 /api/devices-by-wifi", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: "Error buscando dispositivos" 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Registrar dispositivo simple por SSID (SIN LOGIN)
+app.post("/api/register-simple", async (req, res) => {
+  try {
+    const { deviceId, deviceName, wifiSsid } = req.body;
+
+    if (!deviceId || !wifiSsid) {
+      return res.status(400).json({ 
+        success: false,
+        error: "Necesito: deviceId y nombre de WiFi" 
+      });
+    }
+
+    // Generar código de red automático
+    const networkCode = generateNetworkCode(wifiSsid);
+    
+    // Crear usuario automático basado en el WiFi
+    const autoUserId = `user_${networkCode}`;
+
+    // Verificar si el dispositivo ya existe
+    const existingDevice = await findDeviceByEsp32Id(deviceId);
+    
+    if (existingDevice) {
+      // Actualizar dispositivo existente
+      await updateDeviceInSupabase(existingDevice.id, {
+        name: deviceName || existingDevice.name,
+        wifi_ssid: wifiSsid,
+        network_code: networkCode,
+        user_id: autoUserId,
+        is_online: true,
+        last_seen: new Date().toISOString(),
+      });
+      
+      // Actualizar cache
+      if (onlineDevices[deviceId]) {
+        onlineDevices[deviceId].userId = autoUserId;
+        onlineDevices[deviceId].deviceDbId = existingDevice.id;
+        onlineDevices[deviceId].wifiSsid = wifiSsid;
+        onlineDevices[deviceId].networkCode = networkCode;
+      }
+      
+      console.log(`✅ [SIMPLE-REG] ${deviceId} actualizado en WiFi "${wifiSsid}"`);
+      
+      return res.json({
+        success: true,
+        device: existingDevice,
+        networkCode: networkCode,
+        message: "¡Dispositivo actualizado!",
+        instructions: `Usa el código ${networkCode} para ver tus dispositivos desde cualquier lugar`
+      });
+    }
+
+    // Crear nuevo dispositivo
+    const newDeviceData = {
+      esp32_id: deviceId,
+      name: deviceName || `Dispositivo ${deviceId.substring(0, 8)}`,
+      wifi_ssid: wifiSsid,
+      network_code: networkCode,
+      user_id: autoUserId,
+      power: onlineDevices[deviceId]?.lastPower || 0,
+      energy: onlineDevices[deviceId]?.energy || 0,
+      is_online: true,
+      voltage: onlineDevices[deviceId]?.lastData?.voltage || 0,
+      current: onlineDevices[deviceId]?.lastData?.current || 0,
+      frequency: onlineDevices[deviceId]?.lastData?.frequency || 0,
+      power_factor: onlineDevices[deviceId]?.lastData?.powerFactor || 0,
+      daily_consumption: 0,
+      monthly_consumption: 0,
+      total_consumption: 0,
+      last_reset_date: new Date().toDateString(),
+      monthly_reset_date: new Date().getMonth(),
+      energy_at_day_start: 0,
+      energy_at_month_start: 0,
+      total_energy: 0,
+    };
+
+    const createdDevice = await createDeviceInSupabase(newDeviceData);
+
+    if (!createdDevice) {
+      return res.status(500).json({
+        success: false,
+        error: "Error creando dispositivo"
+      });
+    }
+
+    // Actualizar cache
+    if (onlineDevices[deviceId]) {
+      onlineDevices[deviceId].userId = autoUserId;
+      onlineDevices[deviceId].deviceDbId = createdDevice.id;
+      onlineDevices[deviceId].wifiSsid = wifiSsid;
+      onlineDevices[deviceId].networkCode = networkCode;
+    }
+
+    console.log(`✅ [SIMPLE-REG] Nuevo dispositivo ${deviceId} en WiFi "${wifiSsid}"`);
+
+    res.json({
+      success: true,
+      device: createdDevice,
+      networkCode: networkCode,
+      message: "¡Listo! Dispositivo registrado",
+      instructions: `Guarda este código: ${networkCode}. Lo necesitarás para ver tus dispositivos desde otros lugares.`
+    });
+
+  } catch (e) {
+    console.error("💥 /api/register-simple", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Obtener dispositivos por código de red
+app.get("/api/devices-by-code", async (req, res) => {
+  try {
+    const { networkCode } = req.query;
+    
+    if (!networkCode) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Falta el código de red" 
+      });
+    }
+
+    const { data: devices, error } = await supabase
+      .from("devices")
+      .select("*")
+      .eq("network_code", networkCode.trim());
+
+    if (error) {
+      console.error("❌ Error buscando por código:", error.message);
+      return res.status(500).json({ 
+        success: false, 
+        error: "Error en la búsqueda" 
+      });
+    }
+
+    console.log(`🔑 [CODE-SEARCH] Código ${networkCode} → ${devices?.length || 0} dispositivos`);
+    
+    res.json({
+      success: true,
+      networkCode: networkCode,
+      devices: devices || [],
+      count: devices?.length || 0,
+      message: devices?.length === 0 
+        ? "No hay dispositivos con este código"
+        : `Encontré ${devices.length} dispositivo(s)`
+    });
+
+  } catch (e) {
+    console.error("💥 /api/devices-by-code", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: "Error buscando por código" 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Registrar dispositivo (original - mantenido por compatibilidad)
 app.post("/api/register", async (req, res) => {
   try {
     const { deviceId, name, userId, artifactId } = req.body;
@@ -318,6 +608,7 @@ app.post("/api/register", async (req, res) => {
 
     if (!deviceId || !name || !userId) {
       return res.status(400).json({
+        success: false,
         error: "Faltan campos requeridos: deviceId, name, userId",
       });
     }
@@ -325,6 +616,7 @@ app.post("/api/register", async (req, res) => {
     // Validar que userId sea string
     if (typeof userId !== "string") {
       return res.status(400).json({
+        success: false,
         error: "userId debe ser un string válido",
       });
     }
@@ -333,10 +625,16 @@ app.post("/api/register", async (req, res) => {
     if (!artifactId) {
       console.log("🆕 [REGISTER] Creando nuevo dispositivo...");
 
+      // Obtener SSID del dispositivo si está en cache
+      const wifiSsid = onlineDevices[deviceId]?.wifiSsid;
+      const networkCode = wifiSsid ? generateNetworkCode(wifiSsid) : null;
+
       const newDeviceData = {
         user_id: userId,
         name: name,
         esp32_id: deviceId,
+        wifi_ssid: wifiSsid,
+        network_code: networkCode,
         power: 0,
         energy: 0,
         is_online: true,
@@ -358,6 +656,7 @@ app.post("/api/register", async (req, res) => {
 
       if (!createdDevice) {
         return res.status(500).json({
+          success: false,
           error: "Error creando dispositivo en Supabase",
         });
       }
@@ -371,6 +670,8 @@ app.post("/api/register", async (req, res) => {
         ...onlineDevices[deviceId],
         userId: userId,
         deviceDbId: createdDevice.id,
+        wifiSsid: wifiSsid,
+        networkCode: networkCode,
       };
 
       return res.json({
@@ -396,11 +697,17 @@ app.post("/api/register", async (req, res) => {
 
     if (error) {
       console.error("❌ Error en registro:", error.message);
-      return res.status(500).json({ error: error.message });
+      return res.status(500).json({ 
+        success: false,
+        error: error.message 
+      });
     }
 
     if (!data || data.length === 0) {
-      return res.status(404).json({ error: "Dispositivo no encontrado" });
+      return res.status(404).json({ 
+        success: false,
+        error: "Dispositivo no encontrado" 
+      });
     }
 
     console.log(
@@ -421,7 +728,10 @@ app.post("/api/register", async (req, res) => {
     });
   } catch (e) {
     console.error("💥 /api/register", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
   }
 });
 
@@ -429,13 +739,17 @@ app.post("/api/register", async (req, res) => {
 app.post("/api/sync", async (req, res) => {
   try {
     let { artifactId, esp32Id, userId } = req.body;
-    if (!esp32Id) return res.status(400).json({ error: "Falta esp32Id" });
+    if (!esp32Id) return res.status(400).json({ 
+      success: false,
+      error: "Falta esp32Id" 
+    });
 
     const deviceInDb = await findDeviceByEsp32Id(esp32Id);
     if (!deviceInDb) {
-      return res
-        .status(400)
-        .json({ error: "Dispositivo no encontrado en Supabase." });
+      return res.status(400).json({ 
+        success: false,
+        error: "Dispositivo no encontrado en Supabase." 
+      });
     }
 
     const realTimeData = onlineDevices[esp32Id];
@@ -450,14 +764,24 @@ app.post("/api/sync", async (req, res) => {
     });
 
     if (!updateResult) {
-      return res.status(500).json({ error: "Error actualizando en Supabase" });
+      return res.status(500).json({ 
+        success: false,
+        error: "Error actualizando en Supabase" 
+      });
     }
 
     console.log(`🔄 Sincronizado ${esp32Id} -> artifact ${deviceInDb.id}`);
-    res.json({ ok: true, power, energy });
+    res.json({ 
+      success: true, 
+      power, 
+      energy 
+    });
   } catch (e) {
     console.error("💥 /api/sync", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
   }
 });
 
@@ -475,17 +799,26 @@ app.get("/api/unregistered", async (req, res) => {
         power: state.lastPower,
         voltage: state.lastData?.voltage || 0,
         current: state.lastData?.current || 0,
-        energy: state.energy || 0, // 🔥 NUEVO: Incluir energía calculada
+        energy: state.energy || 0,
+        wifiSsid: state.wifiSsid, // 🔥 NUEVO: Incluir SSID
+        networkCode: state.networkCode, // 🔥 NUEVO: Incluir código
       }));
 
-    res.json(result);
+    res.json({
+      success: true,
+      devices: result,
+      count: result.length
+    });
   } catch (e) {
     console.error("💥 /api/unregistered", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
   }
 });
 
-// 📍 ENDPOINT: Datos en tiempo real - VERSIÓN MEJORADA
+// 📍 ENDPOINT: Datos en tiempo real - VERSIÓN MEJORADA CON SSID
 app.get("/api/realtime-data", async (req, res) => {
   try {
     const now = Date.now();
@@ -498,7 +831,10 @@ app.get("/api/realtime-data", async (req, res) => {
 
     if (error) {
       console.error("❌ Error obteniendo dispositivos:", error.message);
-      return res.status(500).json({ error: error.message });
+      return res.status(500).json({ 
+        success: false,
+        error: error.message 
+      });
     }
 
     const out = {};
@@ -520,18 +856,19 @@ app.get("/api/realtime-data", async (req, res) => {
         V: isOnline ? onlineState.lastData?.voltage || 0 : device.voltage || 0,
         I: isOnline ? onlineState.lastData?.current || 0 : device.current || 0,
         P: isOnline ? onlineState.lastPower || 0 : device.power || 0,
-        kWh: currentEnergy, // 🔥 ENERGÍA CALCULADA PRECISAMENTE
+        kWh: currentEnergy,
         Hz: isOnline
           ? onlineState.lastData?.frequency || 0
           : device.frequency || 0,
         PF: isOnline
           ? onlineState.lastData?.powerFactor || 0
           : device.power_factor || 0,
+        wifiSsid: device.wifi_ssid, // 🔥 NUEVO
+        networkCode: device.network_code, // 🔥 NUEVO
         status: isOnline ? "online" : "offline",
         timestamp: isOnline
           ? onlineState.lastSeen
           : new Date(device.last_seen || device.updated_at).getTime() || 0,
-        // 🔥 NUEVO: Información adicional de cálculo
         calculationInfo: isOnline
           ? {
               totalCalculations: onlineState.totalCalculations,
@@ -541,10 +878,17 @@ app.get("/api/realtime-data", async (req, res) => {
       };
     }
 
-    res.json(out);
+    res.json({
+      success: true,
+      data: out,
+      count: Object.keys(out).length
+    });
   } catch (e) {
     console.error("💥 /api/realtime-data", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
   }
 });
 
@@ -552,7 +896,10 @@ app.get("/api/realtime-data", async (req, res) => {
 app.post("/api/unregister", async (req, res) => {
   try {
     const { deviceId } = req.body;
-    if (!deviceId) return res.status(400).json({ error: "Falta deviceId" });
+    if (!deviceId) return res.status(400).json({ 
+      success: false,
+      error: "Falta deviceId" 
+    });
 
     const deviceInDb = await findDeviceByEsp32Id(deviceId);
     if (deviceInDb) {
@@ -568,10 +915,63 @@ app.post("/api/unregister", async (req, res) => {
       delete onlineDevices[deviceId];
     }
 
-    res.json({ success: true, message: "Dispositivo desvinculado" });
+    res.json({ 
+      success: true, 
+      message: "Dispositivo desvinculado" 
+    });
   } catch (e) {
     console.error("💥 /api/unregister", e.message);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Obtener todos los SSIDs disponibles
+app.get("/api/available-wifis", async (req, res) => {
+  try {
+    const now = Date.now();
+    
+    // Obtener SSIDs únicos de dispositivos en cache
+    const uniqueSsids = [...new Set(
+      Object.values(onlineDevices)
+        .filter(state => now - state.lastSeen < ONLINE_TIMEOUT_MS)
+        .map(state => state.wifiSsid)
+        .filter(Boolean)
+    )];
+
+    // Obtener SSIDs únicos de la base de datos
+    const { data: dbDevices, error } = await supabase
+      .from("devices")
+      .select("wifi_ssid")
+      .not("wifi_ssid", "is", null);
+
+    if (!error && dbDevices) {
+      dbDevices.forEach(device => {
+        if (device.wifi_ssid && !uniqueSsids.includes(device.wifi_ssid)) {
+          uniqueSsids.push(device.wifi_ssid);
+        }
+      });
+    }
+
+    console.log(`📶 [WIFI-LIST] ${uniqueSsids.length} SSIDs únicos encontrados`);
+    
+    res.json({
+      success: true,
+      wifis: uniqueSsids.sort(),
+      count: uniqueSsids.length,
+      message: uniqueSsids.length === 0 
+        ? "No hay redes WiFi registradas"
+        : "Redes WiFi disponibles"
+    });
+
+  } catch (e) {
+    console.error("💥 /api/available-wifis", e.message);
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
   }
 });
 
@@ -585,23 +985,25 @@ app.get("/api/health", async (req, res) => {
 
     if (error) throw error;
 
-    // 🔥 INFORMACIÓN ADICIONAL SOBRE CÁLCULOS
-    const deviceStats = Object.entries(onlineDevices).map(([id, state]) => ({
-      deviceId: id,
-      energy: state.energy,
-      calculations: state.totalCalculations,
-      lastSeen: new Date(state.lastSeen).toISOString(),
-    }));
+    // Estadísticas por SSID
+    const ssidStats = {};
+    Object.values(onlineDevices).forEach(state => {
+      if (state.wifiSsid) {
+        ssidStats[state.wifiSsid] = (ssidStats[state.wifiSsid] || 0) + 1;
+      }
+    });
 
     res.json({
+      success: true,
       status: "healthy",
       supabase: "connected",
       onlineDevices: Object.keys(onlineDevices).length,
-      deviceStats: deviceStats,
+      byWifiSsid: ssidStats,
       timestamp: new Date().toISOString(),
     });
   } catch (e) {
     res.status(500).json({
+      success: false,
       status: "unhealthy",
       supabase: "disconnected",
       error: e.message,
@@ -609,14 +1011,33 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// 📍 ENDPOINT: Raíz - Info del sistema
+app.get("/", (req, res) => {
+  res.json({
+    service: "ESP32 Energy Monitor API",
+    version: "2.0 - Sistema Simple por SSID",
+    endpoints: {
+      data: "POST /api/data - Recibir datos del ESP32",
+      devicesByWifi: "GET /api/devices-by-wifi?wifiName=XXXX - Sistema simple",
+      registerSimple: "POST /api/register-simple - Registrar sin login",
+      devicesByCode: "GET /api/devices-by-code?networkCode=XXXX - Por código",
+      availableWifis: "GET /api/available-wifis - Listar WiFi disponibles",
+      health: "GET /api/health - Estado del servidor"
+    },
+    message: "Sistema simple: 'Dime tu nombre de WiFi y ves tus dispositivos'"
+  });
+});
+
 // Iniciar la tarea periódica de limpieza de estado
 const CLEANUP_INTERVAL_MS = 2000;
 setInterval(cleanupOnlineStatus, CLEANUP_INTERVAL_MS);
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Servidor Supabase MEJORADO corriendo en puerto ${PORT}`);
-  console.log(`📊 Supabase URL: ${SUPABASE_URL}`);
-  console.log(`🔑 API Key configurada correctamente`);
+  console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
+  console.log(`📡 Sistema SIMPLE por SSID/WIFI`);
+  console.log(`🔗 Endpoints principales:`);
+  console.log(`   GET  /api/devices-by-wifi?wifiName=TU_WIFI`);
+  console.log(`   POST /api/register-simple (deviceId, deviceName, wifiSsid)`);
+  console.log(`   GET  /api/devices-by-code?networkCode=XXXX`);
   console.log(`⏰ Cleanup interval: ${CLEANUP_INTERVAL_MS}ms`);
-  
 });
