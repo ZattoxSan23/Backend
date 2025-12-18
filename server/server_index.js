@@ -363,9 +363,10 @@ app.post("/api/data", async (req, res) => {
 });
 
 // 📍 ENDPOINT: Buscar dispositivos por nombre de WiFi (SISTEMA SIMPLE)
+// 📍 ENDPOINT MEJORADO: Buscar dispositivos por nombre de WiFi
 app.get("/api/devices-by-wifi", async (req, res) => {
   try {
-    const { wifiName } = req.query;
+    const { wifiName, fuzzy = "true" } = req.query;
     
     if (!wifiName) {
       return res.status(400).json({ 
@@ -375,20 +376,19 @@ app.get("/api/devices-by-wifi", async (req, res) => {
     }
 
     const cleanWifiName = wifiName.trim();
-    
-    console.log(`🔍 [WIFI-SEARCH] Buscando dispositivos en WiFi: "${cleanWifiName}"`);
+    console.log(`🔍 [WIFI-SEARCH] Buscando: "${cleanWifiName}" (fuzzy: ${fuzzy})`);
 
-    // 🔥 Buscar en dispositivos registrados en Supabase
-    const registeredDevices = await findDevicesByWifiSsid(cleanWifiName);
+    // 1. Buscar EXACTO en Supabase
+    const exactDevices = await findDevicesByWifiSsid(cleanWifiName);
 
-    // 🔥 Buscar dispositivos NO registrados que estén en ese WiFi (en cache)
+    // 2. Buscar dispositivos NO registrados en cache (exacto)
     const now = Date.now();
-    const unregisteredDevices = Object.entries(onlineDevices)
+    const unregisteredExact = Object.entries(onlineDevices)
       .filter(([deviceId, state]) => {
         return (
           now - state.lastSeen < ONLINE_TIMEOUT_MS &&
           state.wifiSsid === cleanWifiName &&
-          !state.userId // Solo no registrados
+          !state.userId
         );
       })
       .map(([deviceId, state]) => ({
@@ -398,7 +398,7 @@ app.get("/api/devices-by-wifi", async (req, res) => {
         is_online: true,
         wifi_ssid: state.wifiSsid,
         network_code: state.networkCode,
-        is_temporary: true, // Indica que no está registrado aún
+        is_temporary: true,
         power: state.lastPower || 0,
         voltage: state.lastData?.voltage || 0,
         current: state.lastData?.current || 0,
@@ -407,26 +407,87 @@ app.get("/api/devices-by-wifi", async (req, res) => {
         last_seen: new Date(state.lastSeen).toISOString(),
       }));
 
-    // Combinar resultados
-    const allDevices = [
-      ...registeredDevices.map(device => ({
-        ...device,
-        is_temporary: false,
-        status: device.is_online ? "online" : "offline"
-      })),
-      ...unregisteredDevices
+    let allDevices = [
+      ...exactDevices.map(d => ({ ...d, is_temporary: false, matchType: "exact" })),
+      ...unregisteredExact.map(d => ({ ...d, matchType: "exact" }))
     ];
 
-    console.log(`✅ [WIFI-SEARCH] "${cleanWifiName}" → ${allDevices.length} dispositivos encontrados`);
+    // 3. 🔥 NUEVO: Si fuzzy=true, buscar COINCIDENCIAS PARCIALES
+    if (fuzzy === "true" && allDevices.length === 0) {
+      console.log(`🤔 [FUZZY-SEARCH] Intentando búsqueda difusa...`);
+      
+      // Buscar SSIDs similares en cache
+      const similarSsids = Object.values(onlineDevices)
+        .filter(state => state.wifiSsid && now - state.lastSeen < ONLINE_TIMEOUT_MS)
+        .map(state => state.wifiSsid)
+        .filter(ssid => {
+          // Coincidencia parcial: "MiCasa" vs "MiCasa_5G"
+          const cleanSearch = cleanWifiName.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const cleanSsid = ssid.toLowerCase().replace(/[^a-z0-9]/g, '');
+          
+          return cleanSsid.includes(cleanSearch) || 
+                 cleanSearch.includes(cleanSsid) ||
+                 ssid.toLowerCase().replace(/_5g|5g|_5ghz/gi, '') === cleanWifiName.toLowerCase();
+        });
+      
+      const uniqueSimilar = [...new Set(similarSsids)];
+      
+      if (uniqueSimilar.length > 0) {
+        console.log(`🔍 [FUZZY-SEARCH] SSIDs similares encontrados:`, uniqueSimilar);
+        
+        // Buscar dispositivos en esos SSIDs similares
+        const similarDevices = [];
+        
+        for (const similarSsid of uniqueSimilar) {
+          if (similarSsid !== cleanWifiName) {
+            const devicesInSimilar = Object.entries(onlineDevices)
+              .filter(([deviceId, state]) => {
+                return (
+                  now - state.lastSeen < ONLINE_TIMEOUT_MS &&
+                  state.wifiSsid === similarSsid
+                );
+              })
+              .map(([deviceId, state]) => ({
+                deviceId: deviceId,
+                esp32_id: deviceId,
+                name: `Dispositivo en "${similarSsid}"`,
+                is_online: true,
+                wifi_ssid: state.wifiSsid,
+                network_code: state.networkCode,
+                is_temporary: true,
+                power: state.lastPower || 0,
+                voltage: state.lastData?.voltage || 0,
+                current: state.lastData?.current || 0,
+                energy: state.energy || 0,
+                status: "online",
+                last_seen: new Date(state.lastSeen).toISOString(),
+                matchType: "similar",
+                originalSearch: cleanWifiName,
+                foundIn: similarSsid
+              }));
+            
+            similarDevices.push(...devicesInSimilar);
+          }
+        }
+        
+        allDevices = [...allDevices, ...similarDevices];
+      }
+    }
+
+    console.log(`✅ [WIFI-SEARCH] "${cleanWifiName}" → ${allDevices.length} dispositivos`);
     
     res.json({
       success: true,
       wifiName: cleanWifiName,
       devices: allDevices,
       count: allDevices.length,
+      hasExactMatches: allDevices.some(d => d.matchType === "exact"),
+      hasSimilarMatches: allDevices.some(d => d.matchType === "similar"),
       message: allDevices.length === 0 
         ? "No hay dispositivos conectados a este WiFi. Verifica el nombre."
-        : `Encontré ${allDevices.length} dispositivo(s)`
+        : allDevices.some(d => d.matchType === "similar")
+          ? `No encontramos en "${cleanWifiName}" pero sí en "${allDevices[0].wifi_ssid}". ¿Quizás es esa tu red?`
+          : `Encontré ${allDevices.length} dispositivo(s)`
     });
 
   } catch (e) {
@@ -1010,6 +1071,54 @@ app.get("/api/health", async (req, res) => {
     });
   }
 });
+
+// 📍 ENDPOINT NUEVO: Escaneo activo de dispositivos (para app)
+app.get("/api/active-scan", async (req, res) => {
+  try {
+    const now = Date.now();
+    const timeout = 10000; // 10 segundos máximo
+    
+    // Dispositivos que han enviado datos recientemente
+    const activeDevices = Object.entries(onlineDevices)
+      .filter(([deviceId, state]) => {
+        return now - state.lastSeen < timeout;
+      })
+      .map(([deviceId, state]) => ({
+        deviceId: deviceId,
+        mac: deviceId,
+        name: state.userId ? "Registrado" : "Dispositivo disponible",
+        wifiSsid: state.wifiSsid || "Desconocido",
+        networkCode: state.networkCode,
+        power: state.lastPower || 0,
+        voltage: state.lastData?.voltage || 0,
+        isRegistered: !!state.userId,
+        lastSeen: new Date(state.lastSeen).toISOString(),
+        ageSeconds: Math.floor((now - state.lastSeen) / 1000),
+        signal: "excelente" // Podrías calcular basado en algo
+      }));
+    
+    console.log(`🔍 [ACTIVE-SCAN] ${activeDevices.length} dispositivos activos`);
+    
+    res.json({
+      success: true,
+      scanId: `scan_${Date.now()}`,
+      devices: activeDevices,
+      count: activeDevices.length,
+      timestamp: now,
+      message: activeDevices.length === 0 
+        ? "No hay dispositivos enviando datos. Verifica que estén encendidos."
+        : `Escaneo completado: ${activeDevices.length} dispositivo(s) encontrado(s)`
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/active-scan", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
 
 // 📍 ENDPOINT: Raíz - Info del sistema
 app.get("/", (req, res) => {
