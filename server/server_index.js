@@ -1,4 +1,4 @@
-// server_index.js - VERSIÓN COMPLETA CON SISTEMA SIMPLE POR SSID/WIFI
+// server_index.js - VERSIÓN CORREGIDA COMPLETA
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -34,19 +34,23 @@ app.use((req, res, next) => {
 
 // ====== FUNCIONES AUXILIARES MEJORADAS ======
 
-// 🔥 FUNCIÓN: Generar código de red simple
+// 🔥 FUNCIÓN CORREGIDA: Generar código de red de 5-8 caracteres
 const generateNetworkCode = (ssid) => {
-  if (!ssid || typeof ssid !== 'string') return null;
+  if (!ssid || typeof ssid !== 'string') return "WIFI001";
   
-  // Toma las primeras 4 letras del SSID (sin espacios)
-  const cleanSsid = ssid.replace(/\s+/g, '');
-  const prefix = cleanSsid.substring(0, Math.min(4, cleanSsid.length)).toUpperCase();
+  // Tomar primeras 4 letras del SSID (solo letras/números)
+  const cleanSsid = ssid.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '');
+  let prefix = cleanSsid.substring(0, Math.min(4, cleanSsid.length)).toUpperCase();
   
-  // Si el SSID es muy corto, usa "WIFI"
-  const finalPrefix = prefix || 'WIFI';
-  const randomNum = Math.floor(1000 + Math.random() * 9000);
+  // Si es muy corto, completar con "W"
+  while (prefix.length < 4) {
+    prefix += "W";
+  }
   
-  return `${finalPrefix}${randomNum}`; // Ej: "CASA5678"
+  // 🔥 CORRECCIÓN: Generar número de 3-4 dígitos para total de 7-8 caracteres
+  const randomNum = Math.floor(100 + Math.random() * 9000); // 100-9999
+  
+  return `${prefix}${randomNum}`; // Ej: "SANT1234" (8 caracteres)
 };
 
 // 🔥 FUNCIÓN MEJORADA: Cálculo de energía MUCHO más preciso
@@ -179,6 +183,8 @@ async function findDevicesByWifiSsid(wifiSsid) {
 // 🔥 CORRECCIÓN: Función para crear dispositivo
 async function createDeviceInSupabase(deviceData) {
   try {
+    console.log(`📝 [CREATE-DEVICE] Insertando:`, JSON.stringify(deviceData, null, 2));
+    
     const { data, error } = await supabase
       .from("devices")
       .insert([deviceData])
@@ -187,11 +193,15 @@ async function createDeviceInSupabase(deviceData) {
 
     if (error) {
       console.error("❌ Error creando dispositivo:", error.message);
+      console.error("❌ Detalles del error:", error);
       return null;
     }
+    
+    console.log(`✅ [CREATE-DEVICE] Dispositivo creado exitosamente`);
     return data;
   } catch (e) {
     console.error("❌ Error en createDeviceInSupabase:", e.message);
+    console.error("❌ Stack trace:", e.stack);
     return null;
   }
 }
@@ -499,10 +509,16 @@ app.get("/api/devices-by-wifi", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT: Registrar dispositivo simple por SSID (SIN LOGIN)
+// 📍 ENDPOINT CORREGIDO: Registrar dispositivo simple por SSID (SIN LOGIN)
 app.post("/api/register-simple", async (req, res) => {
   try {
     const { deviceId, deviceName, wifiSsid } = req.body;
+
+    console.log(`📝 [REGISTER-SIMPLE] Datos recibidos:`, {
+      deviceId,
+      deviceName,
+      wifiSsid,
+    });
 
     if (!deviceId || !wifiSsid) {
       return res.status(400).json({ 
@@ -511,18 +527,21 @@ app.post("/api/register-simple", async (req, res) => {
       });
     }
 
-    // Generar código de red automático
+    // 🔥 CORRECCIÓN: Generar código de red
     const networkCode = generateNetworkCode(wifiSsid);
     
-    // Crear usuario automático basado en el WiFi
-    const autoUserId = `user_${networkCode}`;
+    // 🔥 CORRECCIÓN: user_id más simple y válido
+    const autoUserId = `user_${networkCode}`.toLowerCase();
+    console.log(`🔑 [REGISTER-SIMPLE] Código generado: ${networkCode}, User: ${autoUserId}`);
 
     // Verificar si el dispositivo ya existe
     const existingDevice = await findDeviceByEsp32Id(deviceId);
     
     if (existingDevice) {
+      console.log(`🔄 [REGISTER-SIMPLE] Dispositivo existente encontrado: ${existingDevice.id}`);
+      
       // Actualizar dispositivo existente
-      await updateDeviceInSupabase(existingDevice.id, {
+      const updateResult = await updateDeviceInSupabase(existingDevice.id, {
         name: deviceName || existingDevice.name,
         wifi_ssid: wifiSsid,
         network_code: networkCode,
@@ -530,6 +549,10 @@ app.post("/api/register-simple", async (req, res) => {
         is_online: true,
         last_seen: new Date().toISOString(),
       });
+      
+      if (!updateResult) {
+        throw new Error("Error actualizando dispositivo existente");
+      }
       
       // Actualizar cache
       if (onlineDevices[deviceId]) {
@@ -539,7 +562,7 @@ app.post("/api/register-simple", async (req, res) => {
         onlineDevices[deviceId].networkCode = networkCode;
       }
       
-      console.log(`✅ [SIMPLE-REG] ${deviceId} actualizado en WiFi "${wifiSsid}"`);
+      console.log(`✅ [REGISTER-SIMPLE] ${deviceId} actualizado en WiFi "${wifiSsid}"`);
       
       return res.json({
         success: true,
@@ -550,20 +573,24 @@ app.post("/api/register-simple", async (req, res) => {
       });
     }
 
-    // Crear nuevo dispositivo
+    // 🔥 CREAR NUEVO DISPOSITIVO CON DATOS COMPLETOS
+    console.log(`🆕 [REGISTER-SIMPLE] Creando nuevo dispositivo...`);
+    
+    const deviceState = onlineDevices[deviceId] || {};
+    
     const newDeviceData = {
       esp32_id: deviceId,
       name: deviceName || `Dispositivo ${deviceId.substring(0, 8)}`,
       wifi_ssid: wifiSsid,
       network_code: networkCode,
-      user_id: autoUserId,
-      power: onlineDevices[deviceId]?.lastPower || 0,
-      energy: onlineDevices[deviceId]?.energy || 0,
+      user_id: autoUserId, // 🔥 REQUERIDO: NOT NULL
+      power: deviceState.lastPower || 0,
+      energy: deviceState.energy || 0,
       is_online: true,
-      voltage: onlineDevices[deviceId]?.lastData?.voltage || 0,
-      current: onlineDevices[deviceId]?.lastData?.current || 0,
-      frequency: onlineDevices[deviceId]?.lastData?.frequency || 0,
-      power_factor: onlineDevices[deviceId]?.lastData?.powerFactor || 0,
+      voltage: deviceState.lastData?.voltage || 0,
+      current: deviceState.lastData?.current || 0,
+      frequency: deviceState.lastData?.frequency || 0,
+      power_factor: deviceState.lastData?.powerFactor || 0,
       daily_consumption: 0,
       monthly_consumption: 0,
       total_consumption: 0,
@@ -571,15 +598,22 @@ app.post("/api/register-simple", async (req, res) => {
       monthly_reset_date: new Date().getMonth(),
       energy_at_day_start: 0,
       energy_at_month_start: 0,
-      total_energy: 0,
+      total_energy: deviceState.energy || 0,
+      last_energy_update: new Date().toISOString(),
+      last_seen: new Date().toISOString(),
+      type: 'General',
+      linked_at: new Date().toISOString(),
     };
+
+    console.log(`📋 [REGISTER-SIMPLE] Datos a insertar:`, JSON.stringify(newDeviceData, null, 2));
 
     const createdDevice = await createDeviceInSupabase(newDeviceData);
 
     if (!createdDevice) {
+      console.error(`❌ [REGISTER-SIMPLE] Error creando dispositivo en Supabase`);
       return res.status(500).json({
         success: false,
-        error: "Error creando dispositivo"
+        error: "Error creando dispositivo en la base de datos. Verifica los logs."
       });
     }
 
@@ -589,9 +623,28 @@ app.post("/api/register-simple", async (req, res) => {
       onlineDevices[deviceId].deviceDbId = createdDevice.id;
       onlineDevices[deviceId].wifiSsid = wifiSsid;
       onlineDevices[deviceId].networkCode = networkCode;
+    } else {
+      // Si no estaba en cache, agregarlo
+      onlineDevices[deviceId] = {
+        lastSeen: Date.now(),
+        lastTs: Date.now(),
+        lastPower: 0,
+        energy: 0,
+        userId: autoUserId,
+        deviceDbId: createdDevice.id,
+        wifiSsid: wifiSsid,
+        networkCode: networkCode,
+        totalCalculations: 0,
+        lastData: {
+          voltage: 0,
+          current: 0,
+          frequency: 0,
+          powerFactor: 0,
+        },
+      };
     }
 
-    console.log(`✅ [SIMPLE-REG] Nuevo dispositivo ${deviceId} en WiFi "${wifiSsid}"`);
+    console.log(`✅ [REGISTER-SIMPLE] Nuevo dispositivo creado: ${deviceId} en WiFi "${wifiSsid}" - ID: ${createdDevice.id}`);
 
     res.json({
       success: true,
@@ -602,10 +655,23 @@ app.post("/api/register-simple", async (req, res) => {
     });
 
   } catch (e) {
-    console.error("💥 /api/register-simple", e.message);
+    console.error("💥 /api/register-simple ERROR COMPLETO:", e.message);
+    console.error("💥 Stack trace:", e.stack);
+    
+    // 🔥 ERROR DETALLADO PARA DEBUG
+    let errorMessage = e.message;
+    if (e.message.includes('network_code')) {
+      errorMessage = "El código de red debe tener máximo 8 caracteres";
+    } else if (e.message.includes('user_id')) {
+      errorMessage = "Error con el ID de usuario";
+    } else if (e.message.includes('null value')) {
+      errorMessage = "Faltan datos requeridos para crear el dispositivo";
+    }
+    
     res.status(500).json({ 
       success: false, 
-      error: e.message 
+      error: errorMessage,
+      details: process.env.NODE_ENV === 'development' ? e.message : undefined
     });
   }
 });
