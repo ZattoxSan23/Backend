@@ -1186,6 +1186,88 @@ app.get("/api/active-scan", async (req, res) => {
 });
 
 
+// 📍 ENDPOINT NUEVO: Eliminar dispositivo completamente de la base de datos
+app.delete("/api/delete-device/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    
+    if (!deviceId) {
+      return res.status(400).json({ 
+        success: false,
+        error: "Falta deviceId" 
+      });
+    }
+
+    console.log(`🗑️ [DELETE-COMPLETE] Eliminando dispositivo completamente: ${deviceId}`);
+
+    // 1. Primero buscar el dispositivo en Supabase
+    const { data: devices, error: findError } = await supabase
+      .from("devices")
+      .select("id, esp32_id, user_id, name, wifi_ssid")
+      .eq("esp32_id", deviceId)
+      .limit(1);
+
+    if (findError) {
+      console.error("❌ Error buscando dispositivo:", findError.message);
+      return res.status(500).json({ 
+        success: false,
+        error: "Error buscando dispositivo" 
+      });
+    }
+
+    if (!devices || devices.length === 0) {
+      console.log(`ℹ️ [DELETE-COMPLETE] Dispositivo ${deviceId} no encontrado en Supabase`);
+      return res.json({ 
+        success: true,
+        message: "Dispositivo no encontrado (posiblemente ya fue eliminado)" 
+      });
+    }
+
+    const device = devices[0];
+    
+    console.log(`📋 [DELETE-COMPLETE] Encontrado: ID ${device.id}, ${device.name}, WiFi: ${device.wifi_ssid}`);
+
+    // 2. Eliminar el registro de la base de datos
+    const { data: deletedData, error: deleteError } = await supabase
+      .from("devices")
+      .delete()
+      .eq("esp32_id", deviceId)
+      .select();
+
+    if (deleteError) {
+      console.error("❌ Error eliminando dispositivo:", deleteError.message);
+      return res.status(500).json({ 
+        success: false,
+        error: "Error eliminando dispositivo de la base de datos" 
+      });
+    }
+
+    // 3. Eliminar de la cache en memoria si existe
+    if (onlineDevices[deviceId]) {
+      delete onlineDevices[deviceId];
+      console.log(`🧹 [DELETE-COMPLETE] Eliminado de cache en memoria`);
+    }
+
+    console.log(`✅ [DELETE-COMPLETE] Dispositivo ${deviceId} (${device.name}) eliminado completamente de Supabase`);
+    
+    res.json({
+      success: true,
+      message: `Dispositivo ${device.name} eliminado completamente`,
+      deletedDevice: deletedData?.[0],
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (e) {
+    console.error("💥 /api/delete-device/:deviceId ERROR:", e.message);
+    res.status(500).json({ 
+      success: false,
+      error: e.message 
+    });
+  }
+});
+
+
+
 // 📍 ENDPOINT: Raíz - Info del sistema
 app.get("/", (req, res) => {
   res.json({
