@@ -1,4 +1,4 @@
-// server_index.js - VERSIÓN CORREGIDA COMPLETA
+// server_index.js - VERSIÓN COMPLETA CON RECOLECCIÓN AUTOMÁTICA
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -17,6 +17,19 @@ const ONLINE_TIMEOUT_MS = 5000;
 
 // 🔥 ESTRUCTURA MEJORADA CON SSID
 const onlineDevices = {}; // { deviceId: { lastSeen, lastPower, energy, lastTs, wifiSsid, networkCode, ... } }
+
+// ====== CONFIGURACIÓN DE RECOLECCIÓN ======
+const DATA_CONFIG = {
+  saveEveryNReadings: 6,           // Guardar 1 de cada 6 lecturas (cada ~30s)
+  keepRawDataDays: 2,              // Mantener lecturas_raw por 2 días
+  dailySummaryHour: 23,            // Generar resumen a las 23:00
+  dailySummaryMinute: 59,
+  generateWeeklySummary: true,     // Generar resumen semanal
+  generateMonthlySummary: true,    // Generar resumen mensual
+};
+
+// Contadores por dispositivo para controlar frecuencia
+const deviceCounters = {};
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -108,7 +121,6 @@ const initializeDeviceState = (deviceId, deviceInDb, wifiSsid = null) => {
         frequency: 0,
         powerFactor: 0,
       },
-      // 🔥 NUEVO: Datos para cálculo continuo
       calculationData: {
         lastSavedEnergy: deviceInDb?.energy || 0,
         totalEnergyAccumulated: deviceInDb?.energy || 0,
@@ -229,6 +241,377 @@ async function updateDeviceInSupabase(deviceId, updates) {
   }
 }
 
+// ====== FUNCIONES DE RECOLECCIÓN AUTOMÁTICA ======
+
+// 📍 FUNCIÓN OPTIMIZADA: Guardar lectura con frecuencia controlada
+async function saveToLecturasRawOptimized(deviceId, data, finalEnergy) {
+  try {
+    // 🔥 CONTROL DE FRECUENCIA: Solo guardar 1 de cada N lecturas
+    if (!deviceCounters[deviceId]) {
+      deviceCounters[deviceId] = 0;
+    }
+    
+    deviceCounters[deviceId]++;
+    
+    if (deviceCounters[deviceId] % DATA_CONFIG.saveEveryNReadings !== 0) {
+      // No guardar esta vez
+      return false;
+    }
+    
+    // Resetear contador si es muy grande
+    if (deviceCounters[deviceId] > 1000) {
+      deviceCounters[deviceId] = 0;
+    }
+
+    const { data: device, error } = await supabase
+      .from("devices")
+      .select("id")
+      .eq("esp32_id", deviceId)
+      .single();
+
+    if (error || !device) {
+      console.warn(`⚠️ [RAW-DATA] ${deviceId} no encontrado`);
+      return false;
+    }
+
+    // 🔥 GUARDAR con campos optimizados
+    const { error: insertError } = await supabase
+      .from("lecturas_raw")
+      .insert({
+        device_id: deviceId,
+        power: Math.round(data.power),      // SMALLINT
+        energy: parseFloat(finalEnergy.toFixed(4)), // 4 decimales
+        voltage: Math.round(data.voltage),  // SMALLINT
+        current: parseFloat(data.current.toFixed(3)), // 3 decimales
+        timestamp: new Date().toISOString()
+      });
+
+    if (insertError) {
+      console.error(`❌ [RAW-DATA] ${deviceId}:`, insertError.message);
+      return false;
+    }
+
+    // 🔥 LOG reducido (solo cada 10 inserciones)
+    if (deviceCounters[deviceId] % (DATA_CONFIG.saveEveryNReadings * 10) === 0) {
+      console.log(`💾 [RAW-DATA] ${deviceId}: Guardado (${deviceCounters[deviceId]} lecturas procesadas)`);
+    }
+
+    return true;
+  } catch (e) {
+    console.error(`💥 [RAW-DATA] ${deviceId}:`, e.message);
+    return false;
+  }
+}
+
+// 📍 FUNCIÓN MEJORADA: Generar resumen diario con estadísticas
+async function generateDailySummaryOptimized() {
+  try {
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
+    
+    console.log(`📊 [DAILY-SUMMARY] Generando para ${yesterdayStr}...`);
+    
+    // 🔥 Obtener dispositivos que tuvieron actividad ayer
+    const { data: activeDevices, error } = await supabase
+      .from("lecturas_raw")
+      .select("device_id")
+      .distinct()
+      .gte("timestamp", `${yesterdayStr}T00:00:00`)
+      .lt("timestamp", `${yesterdayStr}T23:59:59`);
+
+    if (error || !activeDevices || activeDevices.length === 0) {
+      console.log(`ℹ️ [DAILY-SUMMARY] No hay dispositivos con actividad ayer`);
+      return;
+    }
+
+    console.log(`📊 [DAILY-SUMMARY] ${activeDevices.length} dispositivos con actividad`);
+
+    let processed = 0;
+    let errors = 0;
+
+    // 🔥 Procesar en PARALELO (más rápido)
+    const promises = activeDevices.map(async (item) => {
+      try {
+        const esp32Id = item.device_id;
+        
+        // 🔥 CONSULTA EFICIENTE: Todos los cálculos en una query
+        const { data: stats, error: statsError } = await supabase
+          .from("lecturas_raw")
+          .select(`
+            min(energy) as min_energy,
+            max(energy) as max_energy,
+            max(power) as max_power,
+            avg(power) as avg_power,
+            count(*) as total_readings
+          `)
+          .eq("device_id", esp32Id)
+          .gte("timestamp", `${yesterdayStr}T00:00:00`)
+          .lt("timestamp", `${yesterdayStr}T23:59:59`)
+          .single();
+
+        if (statsError || !stats) {
+          console.warn(`⚠️ [DAILY-SUMMARY] ${esp32Id}: Sin datos suficientes`);
+          return null;
+        }
+
+        const consumoKwh = (stats.max_energy - stats.min_energy);
+        const potenciaPico = stats.max_power;
+        const potenciaPromedio = stats.avg_power;
+        const horasUso = consumoKwh / (potenciaPromedio / 1000) || 0;
+        const costoEstimado = consumoKwh * 0.50;
+        
+        // 🔥 Categoría inteligente (basada en percentiles)
+        let categoria = 'B';
+        if (potenciaPromedio >= 100) categoria = 'A';
+        else if (potenciaPromedio >= 50) categoria = 'M';
+
+        // 🔥 INSERT/UPDATE eficiente
+        const { error: upsertError } = await supabase
+          .from("historicos_compactos")
+          .upsert({
+            device_id: esp32Id,
+            tipo_periodo: 'D',
+            fecha_inicio: yesterdayStr,
+            consumo_total_kwh: parseFloat(consumoKwh.toFixed(3)),
+            potencia_pico_w: Math.round(potenciaPico),
+            potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
+            horas_uso_estimadas: parseFloat(horasUso.toFixed(1)),
+            costo_estimado: parseFloat(costoEstimado.toFixed(2)),
+            dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
+            eficiencia_categoria: categoria,
+            timestamp_creacion: new Date().toISOString()
+          }, {
+            onConflict: 'device_id,tipo_periodo,fecha_inicio'
+          });
+
+        if (upsertError) {
+          console.error(`❌ [DAILY-SUMMARY] ${esp32Id}:`, upsertError.message);
+          errors++;
+          return null;
+        }
+
+        processed++;
+        
+        // 🔥 Actualizar devices
+        await supabase
+          .from("devices")
+          .update({ 
+            daily_consumption: consumoKwh,
+            updated_at: new Date().toISOString()
+          })
+          .eq("esp32_id", esp32Id);
+
+        return { device: esp32Id, consumo: consumoKwh };
+
+      } catch (deviceError) {
+        console.error(`💥 [DAILY-SUMMARY] Error:`, deviceError.message);
+        errors++;
+        return null;
+      }
+    });
+
+    // Esperar todas las promesas
+    const results = await Promise.all(promises);
+    const successful = results.filter(r => r !== null);
+
+    // 🔥 Generar resumen SEMANAL si es domingo
+    if (yesterday.getDay() === 0) { // 0 = domingo
+      await generateWeeklySummaryOptimized(yesterday);
+    }
+
+    // 🔥 Generar resumen MENSUAL si es último día del mes
+    const tomorrow = new Date(yesterday);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (tomorrow.getDate() === 1) { // Mañana es día 1
+      await generateMonthlySummaryOptimized(yesterday);
+    }
+
+    // 🔥 LIMPIEZA: Borrar lecturas_raw antiguas
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - DATA_CONFIG.keepRawDataDays);
+    
+    const { error: deleteError } = await supabase
+      .from("lecturas_raw")
+      .delete()
+      .lt("timestamp", cutoffDate.toISOString());
+
+    if (!deleteError) {
+      console.log(`🧹 [CLEANUP] Lecturas_raw > ${DATA_CONFIG.keepRawDataDays} días eliminadas`);
+    }
+
+    console.log(`✅ [DAILY-SUMMARY] COMPLETADO: ${processed} exitos, ${errors} errores`);
+
+  } catch (e) {
+    console.error(`💥 [DAILY-SUMMARY] Error general:`, e.message);
+  }
+}
+
+// 📍 FUNCIÓN: Generar resumen semanal
+async function generateWeeklySummaryOptimized(lastDayOfWeek) {
+  try {
+    const weekStart = new Date(lastDayOfWeek);
+    weekStart.setDate(weekStart.getDate() - 6); // Retroceder 6 días para inicio de semana
+    
+    const weekStartStr = weekStart.toISOString().split('T')[0];
+    const weekEndStr = lastDayOfWeek.toISOString().split('T')[0];
+    
+    console.log(`📅 [WEEKLY-SUMMARY] Generando para semana ${weekStartStr} a ${weekEndStr}`);
+    
+    // 🔥 Agregar datos semanales
+    const { data: weeklyData, error } = await supabase
+      .from("historicos_compactos")
+      .select(`
+        device_id,
+        sum(consumo_total_kwh) as total_kwh,
+        max(potencia_pico_w) as max_pico,
+        avg(potencia_promedio_w) as avg_potencia
+      `)
+      .eq("tipo_periodo", 'D')
+      .gte("fecha_inicio", weekStartStr)
+      .lte("fecha_inicio", weekEndStr)
+      .group("device_id");
+
+    if (error || !weeklyData) return;
+
+    for (const item of weeklyData) {
+      await supabase
+        .from("historicos_compactos")
+        .upsert({
+          device_id: item.device_id,
+          tipo_periodo: 'S', // Semanal
+          fecha_inicio: weekStartStr,
+          consumo_total_kwh: parseFloat(item.total_kwh.toFixed(3)),
+          potencia_pico_w: item.max_pico,
+          potencia_promedio_w: parseFloat(item.avg_potencia.toFixed(2)),
+          timestamp_creacion: new Date().toISOString()
+        }, {
+          onConflict: 'device_id,tipo_periodo,fecha_inicio'
+        });
+    }
+
+    console.log(`✅ [WEEKLY-SUMMARY] ${weeklyData.length} dispositivos procesados`);
+
+  } catch (e) {
+    console.error(`💥 [WEEKLY-SUMMARY] Error:`, e.message);
+  }
+}
+
+// 📍 FUNCIÓN: Generar resumen mensual
+async function generateMonthlySummaryOptimized(lastDayOfMonth) {
+  try {
+    const monthStart = new Date(lastDayOfMonth.getFullYear(), lastDayOfMonth.getMonth(), 1);
+    const monthStartStr = monthStart.toISOString().split('T')[0];
+    
+    console.log(`🗓️ [MONTHLY-SUMMARY] Generando para mes ${monthStartStr}`);
+    
+    // 🔥 Agregar datos mensuales
+    const { data: monthlyData, error } = await supabase
+      .from("historicos_compactos")
+      .select(`
+        device_id,
+        sum(consumo_total_kwh) as total_kwh,
+        max(potencia_pico_w) as max_pico,
+        avg(potencia_promedio_w) as avg_potencia
+      `)
+      .eq("tipo_periodo", 'D')
+      .gte("fecha_inicio", monthStartStr)
+      .lte("fecha_inicio", lastDayOfMonth.toISOString().split('T')[0])
+      .group("device_id");
+
+    if (error || !monthlyData) return;
+
+    for (const item of monthlyData) {
+      await supabase
+        .from("historicos_compactos")
+        .upsert({
+          device_id: item.device_id,
+          tipo_periodo: 'M', // Mensual
+          fecha_inicio: monthStartStr,
+          consumo_total_kwh: parseFloat(item.total_kwh.toFixed(3)),
+          potencia_pico_w: item.max_pico,
+          potencia_promedio_w: parseFloat(item.avg_potencia.toFixed(2)),
+          timestamp_creacion: new Date().toISOString()
+        }, {
+          onConflict: 'device_id,tipo_periodo,fecha_inicio'
+        });
+      
+      // 🔥 Actualizar consumo mensual en devices
+      await supabase
+        .from("devices")
+        .update({ 
+          monthly_consumption: item.total_kwh,
+          updated_at: new Date().toISOString()
+        })
+        .eq("esp32_id", item.device_id);
+    }
+
+    console.log(`✅ [MONTHLY-SUMMARY] ${monthlyData.length} dispositivos procesados`);
+
+  } catch (e) {
+    console.error(`💥 [MONTHLY-SUMMARY] Error:`, e.message);
+  }
+}
+
+// 📍 FUNCIÓN: Cálculo solar mejorado
+async function calculateSolarRecommendation(deviceId) {
+  try {
+    // 🔥 Obtener consumo de los últimos 30 días
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const { data: monthlyData, error } = await supabase
+      .from("historicos_compactos")
+      .select("consumo_total_kwh")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .gte("fecha_inicio", thirtyDaysAgo.toISOString().split('T')[0]);
+
+    if (error || !monthlyData || monthlyData.length === 0) {
+      return { error: "No hay datos suficientes" };
+    }
+
+    const consumoTotal = monthlyData.reduce((sum, day) => sum + day.consumo_total_kwh, 0);
+    const consumoPromedioDiario = consumoTotal / monthlyData.length;
+    
+    // 🔥 CÁLCULO SOLAR MEJORADO
+    const porcentajeCubrir = 0.7; // 70%
+    const hsCajamarca = 4.5; // Horas sol pico
+    const eficienciaSistema = 0.8; // 80% eficiencia
+    const tarifa = 0.50; // S/ por kWh
+    const costoPanelW = 4.0; // S/ por watt instalado
+    
+    const energiaCubrir = consumoPromedioDiario * 30 * porcentajeCubrir;
+    const potenciaNecesaria = energiaCubrir / (hsCajamarca * 30 * eficienciaSistema);
+    const potenciaW = potenciaNecesaria * 1000;
+    
+    // 🔥 Recomendación realista
+    const panelesRecomendados = Math.ceil(potenciaW / 100); // Paneles de 100W
+    const potenciaInstalada = panelesRecomendados * 100;
+    const inversion = potenciaInstalada * costoPanelW;
+    const ahorroMensual = energiaCubrir * tarifa;
+    const periodoRetorno = inversion / (ahorroMensual * 12);
+    const co2Evitado = energiaCubrir * 0.5; // kg CO2 por kWh
+
+    return {
+      consumoPromedioDiario: parseFloat(consumoPromedioDiario.toFixed(2)),
+      consumoMensual: parseFloat((consumoPromedioDiario * 30).toFixed(2)),
+      panelesRecomendados,
+      potenciaInstalada: `${potenciaInstalada}W`,
+      inversion: `S/ ${inversion.toFixed(2)}`,
+      ahorroMensual: `S/ ${ahorroMensual.toFixed(2)}`,
+      periodoRetorno: `${periodoRetorno.toFixed(1)} años`,
+      co2Evitado: `${co2Evitado.toFixed(1)} kg/mes`,
+      recomendacion: `Con ${panelesRecomendados} paneles de 100W cubrirías el ${(porcentajeCubrir * 100).toFixed(0)}% de tu consumo`
+    };
+
+  } catch (e) {
+    console.error(`💥 [SOLAR-CALC] ${deviceId}:`, e.message);
+    return { error: "Error en cálculo" };
+  }
+}
+
 // ====== FUNCIONES DE MANTENIMIENTO ======
 async function cleanupOnlineStatus() {
   const now = Date.now();
@@ -262,14 +645,50 @@ async function cleanupOnlineStatus() {
   }
 }
 
+// ====== PROGRAMAR TAREAS AUTOMÁTICAS ======
+
+function scheduleOptimizedTasks() {
+  // 🔥 Programar resumen diario
+  const now = new Date();
+  const targetTime = new Date(now);
+  targetTime.setHours(DATA_CONFIG.dailySummaryHour, DATA_CONFIG.dailySummaryMinute, 0, 0);
+  
+  if (now > targetTime) {
+    targetTime.setDate(targetTime.getDate() + 1);
+  }
+  
+  const timeUntilTarget = targetTime.getTime() - now.getTime();
+  
+  setTimeout(() => {
+    generateDailySummaryOptimized();
+    // Repetir cada 24 horas
+    setInterval(generateDailySummaryOptimized, 24 * 60 * 60 * 1000);
+  }, timeUntilTarget);
+  
+  console.log(`⏰ [SCHEDULER] Resumen diario a las ${targetTime.getHours()}:${targetTime.getMinutes()}`);
+  
+  // 🔥 Limpieza cada 6 horas
+  setInterval(async () => {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - DATA_CONFIG.keepRawDataDays);
+    
+    await supabase
+      .from("lecturas_raw")
+      .delete()
+      .lt("timestamp", cutoffDate.toISOString());
+    
+    console.log(`🧹 [AUTO-CLEANUP] Lecturas_raw > ${DATA_CONFIG.keepRawDataDays} días`);
+  }, 6 * 60 * 60 * 1000); // Cada 6 horas
+}
+
 // ====== ENDPOINTS MEJORADOS CON SSID ======
 
-// 📍 ENDPOINT: Recibir datos de ESP32 - CON SSID
+// 📍 ENDPOINT: Recibir datos de ESP32 - CON SSID Y RECOLECCIÓN
 app.post("/api/data", async (req, res) => {
   try {
     const {
       deviceId,
-      wifiSsid,  // 🔥 NUEVO: Recibir el SSID del ESP32
+      wifiSsid,
       voltage,
       current,
       power,
@@ -327,6 +746,9 @@ app.post("/api/data", async (req, res) => {
       },
     };
 
+    // 🔥 🔥 🔥 ¡GUARDAR EN lecturas_raw OPTIMIZADO!
+    await saveToLecturasRawOptimized(deviceId, data, finalEnergy);
+
     // 🔥 SI ESTÁ REGISTRADO, ACTUALIZAR EN SUPABASE CON SSID
     if (isRegistered && deviceDbId) {
       const updates = {
@@ -372,7 +794,6 @@ app.post("/api/data", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT: Buscar dispositivos por nombre de WiFi (SISTEMA SIMPLE)
 // 📍 ENDPOINT MEJORADO: Buscar dispositivos por nombre de WiFi
 app.get("/api/devices-by-wifi", async (req, res) => {
   try {
@@ -431,7 +852,6 @@ app.get("/api/devices-by-wifi", async (req, res) => {
         .filter(state => state.wifiSsid && now - state.lastSeen < ONLINE_TIMEOUT_MS)
         .map(state => state.wifiSsid)
         .filter(ssid => {
-          // Coincidencia parcial: "MiCasa" vs "MiCasa_5G"
           const cleanSearch = cleanWifiName.toLowerCase().replace(/[^a-z0-9]/g, '');
           const cleanSsid = ssid.toLowerCase().replace(/[^a-z0-9]/g, '');
           
@@ -445,7 +865,6 @@ app.get("/api/devices-by-wifi", async (req, res) => {
       if (uniqueSimilar.length > 0) {
         console.log(`🔍 [FUZZY-SEARCH] SSIDs similares encontrados:`, uniqueSimilar);
         
-        // Buscar dispositivos en esos SSIDs similares
         const similarDevices = [];
         
         for (const similarSsid of uniqueSimilar) {
@@ -509,7 +928,7 @@ app.get("/api/devices-by-wifi", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT CORREGIDO: Registrar dispositivo simple por SSID (SIN LOGIN)
+// 📍 ENDPOINT CORREGIDO: Registrar dispositivo simple por SSID
 app.post("/api/register-simple", async (req, res) => {
   try {
     const { deviceId, deviceName, wifiSsid } = req.body;
@@ -529,18 +948,15 @@ app.post("/api/register-simple", async (req, res) => {
 
     // 🔥 CORRECCIÓN: Generar código de red
     const networkCode = generateNetworkCode(wifiSsid);
-    
-    // 🔥 CORRECCIÓN: user_id más simple y válido
     const autoUserId = `user_${networkCode}`.toLowerCase();
+    
     console.log(`🔑 [REGISTER-SIMPLE] Código generado: ${networkCode}, User: ${autoUserId}`);
 
-    // Verificar si el dispositivo ya existe
     const existingDevice = await findDeviceByEsp32Id(deviceId);
     
     if (existingDevice) {
       console.log(`🔄 [REGISTER-SIMPLE] Dispositivo existente encontrado: ${existingDevice.id}`);
       
-      // Actualizar dispositivo existente
       const updateResult = await updateDeviceInSupabase(existingDevice.id, {
         name: deviceName || existingDevice.name,
         wifi_ssid: wifiSsid,
@@ -554,7 +970,6 @@ app.post("/api/register-simple", async (req, res) => {
         throw new Error("Error actualizando dispositivo existente");
       }
       
-      // Actualizar cache
       if (onlineDevices[deviceId]) {
         onlineDevices[deviceId].userId = autoUserId;
         onlineDevices[deviceId].deviceDbId = existingDevice.id;
@@ -573,7 +988,6 @@ app.post("/api/register-simple", async (req, res) => {
       });
     }
 
-    // 🔥 CREAR NUEVO DISPOSITIVO CON DATOS COMPLETOS
     console.log(`🆕 [REGISTER-SIMPLE] Creando nuevo dispositivo...`);
     
     const deviceState = onlineDevices[deviceId] || {};
@@ -583,7 +997,7 @@ app.post("/api/register-simple", async (req, res) => {
       name: deviceName || `Dispositivo ${deviceId.substring(0, 8)}`,
       wifi_ssid: wifiSsid,
       network_code: networkCode,
-      user_id: autoUserId, // 🔥 REQUERIDO: NOT NULL
+      user_id: autoUserId,
       power: deviceState.lastPower || 0,
       energy: deviceState.energy || 0,
       is_online: true,
@@ -617,14 +1031,12 @@ app.post("/api/register-simple", async (req, res) => {
       });
     }
 
-    // Actualizar cache
     if (onlineDevices[deviceId]) {
       onlineDevices[deviceId].userId = autoUserId;
       onlineDevices[deviceId].deviceDbId = createdDevice.id;
       onlineDevices[deviceId].wifiSsid = wifiSsid;
       onlineDevices[deviceId].networkCode = networkCode;
     } else {
-      // Si no estaba en cache, agregarlo
       onlineDevices[deviceId] = {
         lastSeen: Date.now(),
         lastTs: Date.now(),
@@ -658,7 +1070,6 @@ app.post("/api/register-simple", async (req, res) => {
     console.error("💥 /api/register-simple ERROR COMPLETO:", e.message);
     console.error("💥 Stack trace:", e.stack);
     
-    // 🔥 ERROR DETALLADO PARA DEBUG
     let errorMessage = e.message;
     if (e.message.includes('network_code')) {
       errorMessage = "El código de red debe tener máximo 8 caracteres";
@@ -722,7 +1133,7 @@ app.get("/api/devices-by-code", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT: Registrar dispositivo (original - mantenido por compatibilidad)
+// 📍 ENDPOINT: Registrar dispositivo (original)
 app.post("/api/register", async (req, res) => {
   try {
     const { deviceId, name, userId, artifactId } = req.body;
@@ -740,7 +1151,6 @@ app.post("/api/register", async (req, res) => {
       });
     }
 
-    // Validar que userId sea string
     if (typeof userId !== "string") {
       return res.status(400).json({
         success: false,
@@ -748,11 +1158,9 @@ app.post("/api/register", async (req, res) => {
       });
     }
 
-    // 🔥 CORRECCIÓN: Si NO tenemos artifactId, CREAR un nuevo dispositivo
     if (!artifactId) {
       console.log("🆕 [REGISTER] Creando nuevo dispositivo...");
 
-      // Obtener SSID del dispositivo si está en cache
       const wifiSsid = onlineDevices[deviceId]?.wifiSsid;
       const networkCode = wifiSsid ? generateNetworkCode(wifiSsid) : null;
 
@@ -788,11 +1196,8 @@ app.post("/api/register", async (req, res) => {
         });
       }
 
-      console.log(
-        `✅ [REGISTER] Nuevo dispositivo creado: ${createdDevice.id}`
-      );
+      console.log(`✅ [REGISTER] Nuevo dispositivo creado: ${createdDevice.id}`);
 
-      // Actualizar cache en memoria
       onlineDevices[deviceId] = {
         ...onlineDevices[deviceId],
         userId: userId,
@@ -808,7 +1213,6 @@ app.post("/api/register", async (req, res) => {
       });
     }
 
-    // 🔥 Si tenemos artifactId, ACTUALIZAR el dispositivo existente
     console.log("🔄 [REGISTER] Actualizando dispositivo existente...");
     const { data, error } = await supabase
       .from("devices")
@@ -837,11 +1241,8 @@ app.post("/api/register", async (req, res) => {
       });
     }
 
-    console.log(
-      `✅ [REGISTER] Dispositivo ${deviceId} registrado con artifact ${artifactId}`
-    );
+    console.log(`✅ [REGISTER] Dispositivo ${deviceId} registrado con artifact ${artifactId}`);
 
-    // Actualizar cache en memoria
     onlineDevices[deviceId] = {
       ...onlineDevices[deviceId],
       userId: userId,
@@ -927,8 +1328,8 @@ app.get("/api/unregistered", async (req, res) => {
         voltage: state.lastData?.voltage || 0,
         current: state.lastData?.current || 0,
         energy: state.energy || 0,
-        wifiSsid: state.wifiSsid, // 🔥 NUEVO: Incluir SSID
-        networkCode: state.networkCode, // 🔥 NUEVO: Incluir código
+        wifiSsid: state.wifiSsid,
+        networkCode: state.networkCode,
       }));
 
     res.json({
@@ -945,7 +1346,7 @@ app.get("/api/unregistered", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT: Datos en tiempo real - VERSIÓN MEJORADA CON SSID
+// 📍 ENDPOINT: Datos en tiempo real
 app.get("/api/realtime-data", async (req, res) => {
   try {
     const now = Date.now();
@@ -972,7 +1373,6 @@ app.get("/api/realtime-data", async (req, res) => {
       const isOnline =
         onlineState && now - onlineState.lastSeen < ONLINE_TIMEOUT_MS;
 
-      // 🔥 USAR ENERGÍA CALCULADA EN TIEMPO REAL SI ESTÁ DISPONIBLE
       const currentEnergy = isOnline
         ? onlineState.energy || 0
         : device.energy || 0;
@@ -990,8 +1390,8 @@ app.get("/api/realtime-data", async (req, res) => {
         PF: isOnline
           ? onlineState.lastData?.powerFactor || 0
           : device.power_factor || 0,
-        wifiSsid: device.wifi_ssid, // 🔥 NUEVO
-        networkCode: device.network_code, // 🔥 NUEVO
+        wifiSsid: device.wifi_ssid,
+        networkCode: device.network_code,
         status: isOnline ? "online" : "offline",
         timestamp: isOnline
           ? onlineState.lastSeen
@@ -1060,7 +1460,6 @@ app.get("/api/available-wifis", async (req, res) => {
   try {
     const now = Date.now();
     
-    // Obtener SSIDs únicos de dispositivos en cache
     const uniqueSsids = [...new Set(
       Object.values(onlineDevices)
         .filter(state => now - state.lastSeen < ONLINE_TIMEOUT_MS)
@@ -1068,7 +1467,6 @@ app.get("/api/available-wifis", async (req, res) => {
         .filter(Boolean)
     )];
 
-    // Obtener SSIDs únicos de la base de datos
     const { data: dbDevices, error } = await supabase
       .from("devices")
       .select("wifi_ssid")
@@ -1112,7 +1510,6 @@ app.get("/api/health", async (req, res) => {
 
     if (error) throw error;
 
-    // Estadísticas por SSID
     const ssidStats = {};
     Object.values(onlineDevices).forEach(state => {
       if (state.wifiSsid) {
@@ -1138,13 +1535,12 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// 📍 ENDPOINT NUEVO: Escaneo activo de dispositivos (para app)
+// 📍 ENDPOINT: Escaneo activo de dispositivos
 app.get("/api/active-scan", async (req, res) => {
   try {
     const now = Date.now();
-    const timeout = 10000; // 10 segundos máximo
+    const timeout = 10000;
     
-    // Dispositivos que han enviado datos recientemente
     const activeDevices = Object.entries(onlineDevices)
       .filter(([deviceId, state]) => {
         return now - state.lastSeen < timeout;
@@ -1160,7 +1556,7 @@ app.get("/api/active-scan", async (req, res) => {
         isRegistered: !!state.userId,
         lastSeen: new Date(state.lastSeen).toISOString(),
         ageSeconds: Math.floor((now - state.lastSeen) / 1000),
-        signal: "excelente" // Podrías calcular basado en algo
+        signal: "excelente"
       }));
     
     console.log(`🔍 [ACTIVE-SCAN] ${activeDevices.length} dispositivos activos`);
@@ -1185,8 +1581,7 @@ app.get("/api/active-scan", async (req, res) => {
   }
 });
 
-
-// 📍 ENDPOINT NUEVO: Eliminar dispositivo completamente de la base de datos
+// 📍 ENDPOINT: Eliminar dispositivo completamente
 app.delete("/api/delete-device/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -1200,7 +1595,6 @@ app.delete("/api/delete-device/:deviceId", async (req, res) => {
 
     console.log(`🗑️ [DELETE-COMPLETE] Eliminando dispositivo completamente: ${deviceId}`);
 
-    // 1. Primero buscar el dispositivo en Supabase
     const { data: devices, error: findError } = await supabase
       .from("devices")
       .select("id, esp32_id, user_id, name, wifi_ssid")
@@ -1227,7 +1621,6 @@ app.delete("/api/delete-device/:deviceId", async (req, res) => {
     
     console.log(`📋 [DELETE-COMPLETE] Encontrado: ID ${device.id}, ${device.name}, WiFi: ${device.wifi_ssid}`);
 
-    // 2. Eliminar el registro de la base de datos
     const { data: deletedData, error: deleteError } = await supabase
       .from("devices")
       .delete()
@@ -1242,7 +1635,6 @@ app.delete("/api/delete-device/:deviceId", async (req, res) => {
       });
     }
 
-    // 3. Eliminar de la cache en memoria si existe
     if (onlineDevices[deviceId]) {
       delete onlineDevices[deviceId];
       console.log(`🧹 [DELETE-COMPLETE] Eliminado de cache en memoria`);
@@ -1266,22 +1658,316 @@ app.delete("/api/delete-device/:deviceId", async (req, res) => {
   }
 });
 
+// ====== 🔥 ENDPOINTS NUEVOS DE RECOLECCIÓN ======
 
+// 📍 ENDPOINT: Generar reporte diario manual
+app.post("/api/generate-daily-summary", async (req, res) => {
+  try {
+    console.log(`🔄 [MANUAL-TRIGGER] Generando resumen diario por solicitud...`);
+    await generateDailySummaryOptimized();
+    
+    res.json({
+      success: true,
+      message: "Resumen diario generado exitosamente",
+      timestamp: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error("💥 /api/generate-daily-summary", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Obtener análisis histórico
+app.get("/api/historical-analysis/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { days = 30 } = req.query;
+    
+    if (!deviceId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Falta deviceId" 
+      });
+    }
+    
+    const { data: historicos, error } = await supabase
+      .from("historicos_compactos")
+      .select("*")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .order("fecha_inicio", { ascending: false })
+      .limit(parseInt(days));
+    
+    if (error) {
+      console.error("❌ Error obteniendo históricos:", error.message);
+      return res.status(500).json({ 
+        success: false, 
+        error: "Error obteniendo datos históricos" 
+      });
+    }
+    
+    const estadisticas = {
+      totalDias: historicos?.length || 0,
+      consumoTotal: 0,
+      costoTotal: 0,
+      picoMaximo: 0,
+      diasAltoConsumo: 0,
+      promedioDiario: 0
+    };
+    
+    if (históricos && historicos.length > 0) {
+      historicos.forEach(day => {
+        estadisticas.consumoTotal += day.consumo_total_kwh || 0;
+        estadisticas.costoTotal += day.costo_estimado || 0;
+        if (day.potencia_pico_w > estadisticas.picoMaximo) {
+          estadisticas.picoMaximo = day.potencia_pico_w;
+        }
+        if (day.dias_alto_consumo > 0) {
+          estadisticas.diasAltoConsumo++;
+        }
+      });
+      estadisticas.promedioDiario = estadisticas.consumoTotal / historicos.length;
+    }
+    
+    const recomendacionSolar = estadisticas.promedioDiario > 0 ? {
+      consumoMensual: estadisticas.promedioDiario * 30,
+      panelesRecomendados: Math.ceil((estadisticas.promedioDiario * 30 * 0.7) / (4.5 * 30 * 0.1)),
+      ahorroMensual: estadisticas.promedioDiario * 30 * 0.7 * 0.50,
+      periodoRetorno: 36
+    } : null;
+    
+    res.json({
+      success: true,
+      deviceId: deviceId,
+      periodosAnalizados: days,
+      historicos: historicos || [],
+      estadisticas: estadisticas,
+      recomendacionSolar: recomendacionSolar,
+      message: historicos?.length === 0 
+        ? "No hay datos históricos para este dispositivo"
+        : `Análisis de ${históricos.length} días completado`
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/historical-analysis/:deviceId", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Recomendación solar mejorada
+app.get("/api/solar-recommendation/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    
+    if (!deviceId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Falta deviceId" 
+      });
+    }
+    
+    const recommendation = await calculateSolarRecommendation(deviceId);
+    
+    if (recommendation.error) {
+      return res.status(404).json({
+        success: false,
+        error: recommendation.error
+      });
+    }
+    
+    res.json({
+      success: true,
+      deviceId,
+      recommendation,
+      timestamp: new Date().toISOString(),
+      note: "Basado en los últimos 30 días de consumo"
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/solar-recommendation/:deviceId", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Simular datos para pruebas/paper
+app.post("/api/simulate-data", async (req, res) => {
+  try {
+    const { deviceId, days = 7 } = req.body;
+    
+    if (!deviceId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Falta deviceId" 
+      });
+    }
+    
+    const existingDevice = await findDeviceByEsp32Id(deviceId);
+    if (!existingDevice) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Dispositivo no encontrado. Regístralo primero." 
+      });
+    }
+    
+    console.log(`🎮 [SIMULATE-API] Simulando ${days} días para ${deviceId}...`);
+    
+    for (let i = 0; i < days; i++) {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      const dateStr = date.toISOString().split('T')[0];
+      
+      const consumoKwh = 0.8 + Math.random() * 0.8;
+      const potenciaPico = 80 + Math.random() * 60;
+      const potenciaPromedio = 50 + Math.random() * 40;
+      
+      await supabase
+        .from("historicos_compactos")
+        .insert({
+          device_id: deviceId,
+          tipo_periodo: 'D',
+          fecha_inicio: dateStr,
+          consumo_total_kwh: consumoKwh,
+          potencia_pico_w: Math.round(potenciaPico),
+          potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
+          horas_uso_estimadas: parseFloat((consumoKwh / (potenciaPromedio / 1000)).toFixed(1)),
+          costo_estimado: parseFloat((consumoKwh * 0.50).toFixed(2)),
+          eficiencia_categoria: potenciaPromedio < 80 ? 'B' : 'M'
+        })
+        .select();
+    }
+    
+    console.log(`✅ [SIMULATE-API] ${days} días simulados para ${deviceId}`);
+    
+    res.json({
+      success: true,
+      message: `${days} días de datos simulados para ${deviceId}`,
+      device: existingDevice.name,
+      daysSimulated: days,
+      timestamp: new Date().toISOString(),
+      note: "Datos generados en tabla historicos_compactos para análisis"
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/simulate-data", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Limpiar datos antiguos
+app.post("/api/cleanup-old-data", async (req, res) => {
+  try {
+    const { daysToKeep = 2 } = req.body;
+    
+    const cutoffDate = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000);
+    
+    const { count: rawDeleted } = await supabase
+      .from("lecturas_raw")
+      .delete()
+      .lt("timestamp", cutoffDate.toISOString());
+    
+    console.log(`🧹 [CLEANUP] Eliminadas ${rawDeleted} lecturas_raw > ${daysToKeep} días`);
+    
+    res.json({
+      success: true,
+      message: `Datos antiguos limpiados (conservando últimos ${daysToKeep} días)`,
+      lecturas_raw_eliminadas: rawDeleted || 0,
+      cutoffDate: cutoffDate.toISOString()
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/cleanup-old-data", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
+// 📍 ENDPOINT: Estadísticas del sistema
+app.get("/api/system-stats", async (req, res) => {
+  try {
+    const { data: devicesStats } = await supabase
+      .from("devices")
+      .select("count, is_online")
+      .single();
+    
+    const { data: rawStats } = await supabase
+      .from("lecturas_raw")
+      .select("count, min(timestamp), max(timestamp)")
+      .single();
+    
+    const { data: historicosStats } = await supabase
+      .from("historicos_compactos")
+      .select("count, tipo_periodo")
+      .group("tipo_periodo");
+    
+    const activeInCache = Object.values(onlineDevices).filter(
+      state => Date.now() - state.lastSeen < ONLINE_TIMEOUT_MS
+    ).length;
+    
+    res.json({
+      success: true,
+      stats: {
+        devices: {
+          total: devicesStats?.count || 0,
+          online: devicesStats?.is_online || 0,
+          inCache: Object.keys(onlineDevices).length,
+          activeInCache: activeInCache
+        },
+        lecturas_raw: {
+          total: rawStats?.count || 0,
+          desde: rawStats?.min || null,
+          hasta: rawStats?.max || null
+        },
+        historicos: historicosStats || [],
+        system: {
+          uptime: process.uptime(),
+          memory: process.memoryUsage(),
+          nodeVersion: process.version
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/system-stats", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
 
 // 📍 ENDPOINT: Raíz - Info del sistema
 app.get("/", (req, res) => {
   res.json({
     service: "ESP32 Energy Monitor API",
-    version: "2.0 - Sistema Simple por SSID",
+    version: "3.0 - Sistema Completo con Recolección Automática",
     endpoints: {
       data: "POST /api/data - Recibir datos del ESP32",
-      devicesByWifi: "GET /api/devices-by-wifi?wifiName=XXXX - Sistema simple",
+      devicesByWifi: "GET /api/devices-by-wifi?wifiName=XXXX",
       registerSimple: "POST /api/register-simple - Registrar sin login",
-      devicesByCode: "GET /api/devices-by-code?networkCode=XXXX - Por código",
-      availableWifis: "GET /api/available-wifis - Listar WiFi disponibles",
-      health: "GET /api/health - Estado del servidor"
+      devicesByCode: "GET /api/devices-by-code?networkCode=XXXX",
+      // 🔥 NUEVOS ENDPOINTS
+      generateDailySummary: "POST /api/generate-daily-summary",
+      historicalAnalysis: "GET /api/historical-analysis/:deviceId",
+      solarRecommendation: "GET /api/solar-recommendation/:deviceId",
+      simulateData: "POST /api/simulate-data",
+      systemStats: "GET /api/system-stats"
     },
-    message: "Sistema simple: 'Dime tu nombre de WiFi y ves tus dispositivos'"
+    message: "Sistema completo de monitorización energética con recolección automática"
   });
 });
 
@@ -1289,12 +1975,25 @@ app.get("/", (req, res) => {
 const CLEANUP_INTERVAL_MS = 2000;
 setInterval(cleanupOnlineStatus, CLEANUP_INTERVAL_MS);
 
+// 🔥 INICIAR SERVIDOR
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
-  console.log(`📡 Sistema SIMPLE por SSID/WIFI`);
+  console.log(`📡 Sistema COMPLETO por SSID/WIFI con RECOLECCIÓN AUTOMÁTICA`);
   console.log(`🔗 Endpoints principales:`);
   console.log(`   GET  /api/devices-by-wifi?wifiName=TU_WIFI`);
   console.log(`   POST /api/register-simple (deviceId, deviceName, wifiSsid)`);
   console.log(`   GET  /api/devices-by-code?networkCode=XXXX`);
+  console.log(`   POST /api/data (para ESP32)`);
+  console.log(`📊 Sistema de RECOLECCIÓN AUTOMÁTICA activado`);
+  console.log(`   ⏰ Resumen diario: ${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute} cada día`);
+  console.log(`   💾 Guarda 1 de cada ${DATA_CONFIG.saveEveryNReadings} lecturas (cada ~${DATA_CONFIG.saveEveryNReadings*5}s)`);
+  console.log(`   🧹 Limpieza automática cada 6 horas`);
+  console.log(`📈 Endpoints de análisis:`);
+  console.log(`   GET  /api/historical-analysis/:deviceId`);
+  console.log(`   GET  /api/solar-recommendation/:deviceId`);
+  console.log(`   POST /api/simulate-data (para pruebas/paper)`);
   console.log(`⏰ Cleanup interval: ${CLEANUP_INTERVAL_MS}ms`);
+  
+  // 🔥 INICIAR TAREAS PROGRAMADAS
+  scheduleOptimizedTasks();
 });
