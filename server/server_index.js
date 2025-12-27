@@ -749,35 +749,178 @@ app.post("/api/force-generate-historical/:deviceId", async (req, res) => {
   }
 });
 
+// 🔥 REEMPLAZAR LA FUNCIÓN scheduleOptimizedTasks() con esta versión
 function scheduleOptimizedTasks() {
-  // 🔥 EJECUTAR INMEDIATAMENTE al iniciar
-  console.log("⏰ Ejecutando resumen diario inmediatamente...");
-  generateDailySummaryOptimized();
+  console.log("⏰ [SCHEDULER] Iniciando programación de tareas optimizadas...");
   
-  // 🔥 Generar resumen por hora cada hora
-  console.log("⏰ Programando resumen por hora...");
-  generateHourlySummaryOptimized(); // Ejecutar ahora
-  setInterval(generateHourlySummaryOptimized, 60 * 60 * 1000); // Cada hora
+  // 🔥 1. Ejecutar resumen por hora INMEDIATAMENTE (para datos pendientes)
+  console.log("🔄 Ejecutando resumen por hora inicial...");
+  generateHourlySummaryOptimized();
   
-  // 🔥 Programar resumen diario para el futuro
+  // 🔥 2. Programar resumen por hora CADA HORA en punto
   const now = new Date();
-  const targetTime = new Date(now);
-  targetTime.setHours(DATA_CONFIG.dailySummaryHour, DATA_CONFIG.dailySummaryMinute, 0, 0);
+  const nextHour = new Date(now);
+  nextHour.setHours(nextHour.getHours() + 1);
+  nextHour.setMinutes(0, 0, 0); // En punto
   
-  if (now > targetTime) {
-    targetTime.setDate(targetTime.getDate() + 1);
+  const msUntilNextHour = nextHour.getTime() - now.getTime();
+  
+  console.log(`⏰ Programando resumen por hora para: ${nextHour.getHours()}:00 (en ${Math.round(msUntilNextHour/1000/60)} minutos)`);
+  
+  setTimeout(() => {
+    // Primera ejecución en la hora en punto
+    generateHourlySummaryOptimized();
+    
+    // Programar cada hora (60 minutos * 60 segundos * 1000 ms)
+    const hourlyInterval = setInterval(generateHourlySummaryOptimized, 60 * 60 * 1000);
+    
+    // Guardar referencia para posible limpieza
+    global.hourlyInterval = hourlyInterval;
+    
+    console.log("✅ [SCHEDULER] Resumen por hora programado CADA HORA");
+  }, msUntilNextHour);
+  
+  // 🔥 3. Programar resumen diario
+  const targetTimeDaily = new Date(now);
+  targetTimeDaily.setHours(DATA_CONFIG.dailySummaryHour, DATA_CONFIG.dailySummaryMinute, 0, 0);
+  
+  if (now > targetTimeDaily) {
+    targetTimeDaily.setDate(targetTimeDaily.getDate() + 1);
   }
   
-  const timeUntilTarget = targetTime.getTime() - now.getTime();
+  const msUntilDaily = targetTimeDaily.getTime() - now.getTime();
   
   setTimeout(() => {
     generateDailySummaryOptimized();
     // Repetir cada 24 horas
     setInterval(generateDailySummaryOptimized, 24 * 60 * 60 * 1000);
-  }, timeUntilTarget);
+  }, msUntilDaily);
   
-  console.log(`⏰ [SCHEDULER] Resumen diario a las ${targetTime.getHours()}:${targetTime.getMinutes()}`);
+  console.log(`⏰ [SCHEDULER] Resumen diario a las ${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute}`);
+  
+  // 🔥 4. Programar limpieza de datos antiguos cada 6 horas
+  setInterval(async () => {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - DATA_CONFIG.keepRawDataDays);
+    
+    const { error: deleteError } = await supabase
+      .from("lecturas_raw")
+      .delete()
+      .lt("timestamp", cutoffDate.toISOString());
+
+    if (!deleteError) {
+      console.log(`🧹 [CLEANUP] Lecturas_raw > ${DATA_CONFIG.keepRawDataDays} días eliminadas`);
+    }
+  }, 6 * 60 * 60 * 1000); // Cada 6 horas
+  
+  console.log("✅ [SCHEDULER] Todas las tareas programadas correctamente");
 }
+
+// 🔥 ENDPOINT: Forzar generación de resumen por hora
+app.post("/api/force-hourly-summary", async (req, res) => {
+  try {
+    const { deviceId, specificHour } = req.body;
+    
+    console.log(`🔄 [FORCE-HOURLY] Solicitado por API${deviceId ? ` para dispositivo ${deviceId}` : ''}`);
+    
+    if (deviceId) {
+      // Generar solo para un dispositivo específico
+      const now = new Date();
+      const targetHour = specificHour ? 
+        new Date(specificHour) : 
+        new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() - 1);
+      
+      const dateStr = targetHour.toISOString().split('T')[0];
+      const hour = targetHour.getHours();
+      
+      // Obtener datos del dispositivo
+      const { data: stats, error: statsError } = await supabase
+        .from("lecturas_raw")
+        .select(`
+          min(energy) as min_energy,
+          max(energy) as max_energy,
+          max(power) as max_power,
+          avg(power) as avg_power,
+          count(*) as total_readings
+        `)
+        .eq("device_id", deviceId)
+        .gte("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`)
+        .lt("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:59:59`)
+        .single();
+      
+      if (statsError || !stats || stats.total_readings < 2) {
+        return res.status(404).json({
+          success: false,
+          error: `No hay suficientes lecturas raw para ${deviceId} en hora ${hour}:00`
+        });
+      }
+      
+      const consumoKwh = (parseFloat(stats.max_energy) - parseFloat(stats.min_energy));
+      const potenciaPico = parseInt(stats.max_power) || 0;
+      const potenciaPromedio = parseFloat(stats.avg_power) || 0;
+      const tarifaPorKwh = 0.50;
+      const costoEstimado = consumoKwh * tarifaPorKwh;
+      
+      let categoria = 'B';
+      if (potenciaPromedio >= 100) categoria = 'A';
+      else if (potenciaPromedio >= 50) categoria = 'M';
+      else if (potenciaPromedio < 10) categoria = 'C';
+      
+      const fechaHoraInicio = `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`;
+      
+      const { error: upsertError } = await supabase
+        .from("historicos_compactos")
+        .upsert({
+          device_id: deviceId,
+          tipo_periodo: 'H',
+          fecha_inicio: fechaHoraInicio,
+          consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)),
+          potencia_pico_w: Math.round(potenciaPico),
+          potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
+          horas_uso_estimadas: 1.0,
+          costo_estimado: parseFloat(costoEstimado.toFixed(4)),
+          dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
+          eficiencia_categoria: categoria,
+          timestamp_creacion: new Date().toISOString()
+        }, {
+          onConflict: 'device_id,tipo_periodo,fecha_inicio'
+        });
+      
+      if (upsertError) {
+        throw new Error(upsertError.message);
+      }
+      
+      res.json({
+        success: true,
+        message: `Resumen por hora generado para ${deviceId} (${hour}:00)`,
+        deviceId: deviceId,
+        hour: `${hour}:00`,
+        date: dateStr,
+        consumption: parseFloat(consumoKwh.toFixed(6)),
+        cost: parseFloat(costoEstimado.toFixed(4)),
+        readings: stats.total_readings,
+        timestamp: new Date().toISOString()
+      });
+      
+    } else {
+      // Generar para TODOS los dispositivos
+      await generateHourlySummaryOptimized();
+      
+      res.json({
+        success: true,
+        message: "Resumen por hora generado para todos los dispositivos",
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+  } catch (e) {
+    console.error("💥 /api/force-hourly-summary", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
 
 // ====== ENDPOINTS MEJORADOS CON SSID ======
 
@@ -1926,40 +2069,42 @@ app.get("/api/historical-analysis/:deviceId", async (req, res) => {
   }
 });
 
-// 📍 FUNCIÓN: Generar resumen por hora
+// 🔥 CORRECCIÓN: GENERAR RESUMEN POR HORA CON LECTURAS RAW - VERSIÓN MEJORADA
 async function generateHourlySummaryOptimized() {
   try {
     const now = new Date();
     const previousHour = new Date(now);
     previousHour.setHours(previousHour.getHours() - 1);
     
-    const hourStr = previousHour.toISOString().split('T')[0];
+    const dateStr = previousHour.toISOString().split('T')[0];
     const hour = previousHour.getHours();
     
-    console.log(`⏰ [HOURLY-SUMMARY] Generando para ${hourStr} ${hour}:00`);
+    console.log(`⏰ [HOURLY-SUMMARY] Generando para ${dateStr} ${hour}:00:00`);
     
-    // Obtener dispositivos que tuvieron actividad en la hora anterior
+    // 🔥 1. Obtener TODOS los dispositivos que tienen lecturas_raw en la hora anterior
     const { data: activeDevices, error } = await supabase
       .from("lecturas_raw")
       .select("device_id")
       .distinct()
-      .gte("timestamp", `${hourStr}T${hour.toString().padStart(2, '0')}:00:00`)
-      .lt("timestamp", `${hourStr}T${hour.toString().padStart(2, '0')}:59:59`);
+      .gte("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`)
+      .lt("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:59:59`);
 
     if (error || !activeDevices || activeDevices.length === 0) {
       console.log(`ℹ️ [HOURLY-SUMMARY] No hay dispositivos con actividad en la hora anterior`);
       return;
     }
 
-    console.log(`📊 [HOURLY-SUMMARY] ${activeDevices.length} dispositivos con actividad`);
+    console.log(`📊 [HOURLY-SUMMARY] ${activeDevices.length} dispositivos con actividad en hora ${hour}:00`);
 
     let processed = 0;
     let errors = 0;
 
+    // 🔥 2. Procesar CADA DISPOSITIVO con sus lecturas raw reales
     const promises = activeDevices.map(async (item) => {
       try {
         const esp32Id = item.device_id;
         
+        // 🔥 3. Obtener ESTADÍSTICAS PRECISAS de las lecturas raw de esa hora
         const { data: stats, error: statsError } = await supabase
           .from("lecturas_raw")
           .select(`
@@ -1967,40 +2112,54 @@ async function generateHourlySummaryOptimized() {
             max(energy) as max_energy,
             max(power) as max_power,
             avg(power) as avg_power,
-            count(*) as total_readings
+            count(*) as total_readings,
+            min(timestamp) as first_reading,
+            max(timestamp) as last_reading
           `)
           .eq("device_id", esp32Id)
-          .gte("timestamp", `${hourStr}T${hour.toString().padStart(2, '0')}:00:00`)
-          .lt("timestamp", `${hourStr}T${hour.toString().padStart(2, '0')}:59:59`)
+          .gte("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`)
+          .lt("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:59:59`)
           .single();
 
-        if (statsError || !stats) {
-          console.warn(`⚠️ [HOURLY-SUMMARY] ${esp32Id}: Sin datos suficientes`);
+        if (statsError || !stats || stats.total_readings < 2) {
+          console.warn(`⚠️ [HOURLY-SUMMARY] ${esp32Id}: Sin datos suficientes (${stats?.total_readings || 0} lecturas)`);
           return null;
         }
 
-        const consumoKwh = (stats.max_energy - stats.min_energy);
-        const potenciaPico = stats.max_power;
-        const potenciaPromedio = stats.avg_power;
-        const horasUso = consumoKwh / (potenciaPromedio / 1000) || 0;
-        const costoEstimado = consumoKwh * 0.50;
+        // 🔥 4. CÁLCULO PRECISO basado en lecturas raw (no aproximaciones)
+        const consumoKwh = (parseFloat(stats.max_energy) - parseFloat(stats.min_energy));
+        const potenciaPico = parseInt(stats.max_power) || 0;
+        const potenciaPromedio = parseFloat(stats.avg_power) || 0;
         
+        // 🔥 Cálculo REAL de horas de uso (no estimado)
+        const timeDiffMs = new Date(stats.last_reading) - new Date(stats.first_reading);
+        const timeDiffHours = timeDiffMs / (1000 * 60 * 60); // Convertir a horas
+        const horasUso = timeDiffHours > 0 ? timeDiffHours : 0.1; // Mínimo 0.1 horas si el tiempo es muy corto
+        
+        // 🔥 Costo basado en tarifa REAL
+        const tarifaPorKwh = 0.50; // S/ por kWh
+        const costoEstimado = consumoKwh * tarifaPorKwh;
+        
+        // 🔥 5. Categoría de eficiencia basada en datos REALES
         let categoria = 'B';
         if (potenciaPromedio >= 100) categoria = 'A';
         else if (potenciaPromedio >= 50) categoria = 'M';
+        else if (potenciaPromedio < 10) categoria = 'C';
 
-        // Insertar el resumen por hora
+        // 🔥 6. Insertar/Actualizar en historicos_compactos
+        const fechaHoraInicio = `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`;
+        
         const { error: upsertError } = await supabase
           .from("historicos_compactos")
           .upsert({
             device_id: esp32Id,
             tipo_periodo: 'H', // Hora
-            fecha_inicio: `${hourStr}T${hour.toString().padStart(2, '0')}:00:00`,
-            consumo_total_kwh: parseFloat(consumoKwh.toFixed(3)),
+            fecha_inicio: fechaHoraInicio,
+            consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)), // 6 decimales de precisión
             potencia_pico_w: Math.round(potenciaPico),
             potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
-            horas_uso_estimadas: parseFloat(horasUso.toFixed(1)),
-            costo_estimado: parseFloat(costoEstimado.toFixed(2)),
+            horas_uso_estimadas: parseFloat(horasUso.toFixed(2)),
+            costo_estimado: parseFloat(costoEstimado.toFixed(4)), // 4 decimales para costo
             dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
             eficiencia_categoria: categoria,
             timestamp_creacion: new Date().toISOString()
@@ -2015,24 +2174,439 @@ async function generateHourlySummaryOptimized() {
         }
 
         processed++;
-        return { device: esp32Id, consumo: consumoKwh };
+        
+        // 🔥 7. Actualizar dispositivo con datos de la última hora
+        await supabase
+          .from("devices")
+          .update({ 
+            last_hour_consumption: consumoKwh,
+            last_hour_power: potenciaPromedio,
+            updated_at: new Date().toISOString()
+          })
+          .eq("esp32_id", esp32Id);
+
+        console.log(`✅ [HOURLY-SUMMARY] ${esp32Id}: ${consumoKwh.toFixed(6)} kWh, ${potenciaPromedio.toFixed(1)} W avg`);
+
+        return { 
+          device: esp32Id, 
+          consumo: consumoKwh,
+          lecturas: stats.total_readings,
+          tiempo_horas: horasUso
+        };
 
       } catch (deviceError) {
-        console.error(`💥 [HOURLY-SUMMARY] Error:`, deviceError.message);
+        console.error(`💥 [HOURLY-SUMMARY] Error en ${item.device_id}:`, deviceError.message);
         errors++;
         return null;
       }
     });
 
+    // Esperar todas las promesas
     const results = await Promise.all(promises);
     const successful = results.filter(r => r !== null);
 
     console.log(`✅ [HOURLY-SUMMARY] COMPLETADO: ${processed} exitos, ${errors} errores`);
+    
+    // 🔥 8. Guardar estadísticas del resumen por hora
+    if (successful.length > 0) {
+      const totalLecturas = successful.reduce((sum, item) => sum + (item.lecturas || 0), 0);
+      const totalConsumo = successful.reduce((sum, item) => sum + (item.consumo || 0), 0);
+      
+      console.log(`📈 [HOURLY-SUMMARY] Estadísticas:`);
+      console.log(`   Total dispositivos: ${successful.length}`);
+      console.log(`   Total lecturas raw: ${totalLecturas}`);
+      console.log(`   Total consumo: ${totalConsumo.toFixed(6)} kWh`);
+      console.log(`   Hora procesada: ${hour}:00 (${dateStr})`);
+    }
 
   } catch (e) {
     console.error(`💥 [HOURLY-SUMMARY] Error general:`, e.message);
+    console.error(e.stack);
   }
 }
+
+
+
+// 🔥 ENDPOINT: Pronóstico de precio usando TODAS las lecturas raw
+app.get("/api/price-forecast/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { 
+      hours = 24,          // Horas a pronosticar
+      useRaw = "true",     // Usar lecturas raw (true) o solo agregados (false)
+      confidence = 0.95    // Nivel de confianza del pronóstico
+    } = req.query;
+    
+    if (!deviceId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: "Falta deviceId" 
+      });
+    }
+    
+    console.log(`🔮 [PRICE-FORECAST] Solicitado para ${deviceId}, ${hours} horas, useRaw: ${useRaw}`);
+    
+    // 🔥 1. Verificar que el dispositivo existe
+    const { data: device, error: deviceError } = await supabase
+      .from("devices")
+      .select("id, esp32_id, name, type, wifi_ssid")
+      .eq("esp32_id", deviceId)
+      .single();
+    
+    if (deviceError || !device) {
+      return res.status(404).json({ 
+        success: false, 
+        error: "Dispositivo no encontrado" 
+      });
+    }
+    
+    // 🔥 2. Obtener datos históricos según el método elegido
+    let historicalData = [];
+    let dataSource = "";
+    let totalReadings = 0;
+    
+    if (useRaw === "true") {
+      // 🔥 USAR LECTURAS RAW (todos los datos disponibles)
+      const hoursAgo = new Date();
+      hoursAgo.setHours(hoursAgo.getHours() - parseInt(hours));
+      
+      const { data: rawData, error: rawError } = await supabase
+        .from("lecturas_raw")
+        .select(`
+          timestamp,
+          power,
+          energy,
+          voltage,
+          current
+        `)
+        .eq("device_id", deviceId)
+        .gte("timestamp", hoursAgo.toISOString())
+        .order("timestamp", { ascending: true });
+      
+      if (!rawError && rawData && rawData.length > 0) {
+        historicalData = rawData;
+        totalReadings = rawData.length;
+        dataSource = "lecturas_raw";
+        console.log(`📊 [PRICE-FORECAST] ${totalReadings} lecturas raw obtenidas`);
+      }
+    }
+    
+    // 🔥 3. Si no hay lecturas raw o se solicita usar agregados, usar historicos_compactos
+    if (historicalData.length === 0) {
+      const { data: compactData, error: compactError } = await supabase
+        .from("historicos_compactos")
+        .select(`
+          fecha_inicio,
+          consumo_total_kwh,
+          potencia_promedio_w,
+          costo_estimado,
+          tipo_periodo
+        `)
+        .eq("device_id", deviceId)
+        .eq("tipo_periodo", 'H') // Usar datos por hora
+        .order("fecha_inicio", { ascending: false })
+        .limit(parseInt(hours));
+      
+      if (!compactError && compactData) {
+        historicalData = compactData;
+        totalReadings = compactData.length;
+        dataSource = "historicos_compactos (H)";
+        console.log(`📊 [PRICE-FORECAST] ${totalReadings} registros horarios obtenidos`);
+      }
+    }
+    
+    // 🔥 4. Si no hay datos de ninguna fuente, usar datos actuales del dispositivo
+    if (historicalData.length === 0) {
+      const { data: currentDevice, error: currentError } = await supabase
+        .from("devices")
+        .select("power, energy, last_seen")
+        .eq("esp32_id", deviceId)
+        .single();
+      
+      if (!currentError && currentDevice) {
+        historicalData = [{
+          timestamp: currentDevice.last_seen || new Date().toISOString(),
+          power: currentDevice.power || 0,
+          energy: currentDevice.energy || 0,
+          consumo_total_kwh: currentDevice.energy || 0,
+          potencia_promedio_w: currentDevice.power || 0
+        }];
+        dataSource = "datos actuales del dispositivo";
+        totalReadings = 1;
+      }
+    }
+    
+    if (historicalData.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "No hay datos históricos para hacer pronóstico"
+      });
+    }
+    
+    // 🔥 5. ANÁLISIS ESTADÍSTICO AVANZADO con lecturas raw
+    let analysis = {
+      totalReadings: totalReadings,
+      dataSource: dataSource,
+      timeRange: {},
+      statistics: {},
+      patterns: {}
+    };
+    
+    if (dataSource === "lecturas_raw" && historicalData.length > 1) {
+      // 🔥 ANÁLISIS DETALLADO CON LECTURAS RAW
+      const readings = historicalData;
+      
+      // Ordenar por timestamp
+      readings.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      
+      const firstTime = new Date(readings[0].timestamp);
+      const lastTime = new Date(readings[readings.length - 1].timestamp);
+      const totalHours = (lastTime - firstTime) / (1000 * 60 * 60);
+      
+      analysis.timeRange = {
+        from: firstTime.toISOString(),
+        to: lastTime.toISOString(),
+        totalHours: parseFloat(totalHours.toFixed(2)),
+        readingsPerHour: parseFloat((readings.length / totalHours).toFixed(1))
+      };
+      
+      // Estadísticas básicas
+      const powers = readings.map(r => r.power || 0);
+      const energies = readings.map(r => r.energy || 0);
+      
+      analysis.statistics = {
+        avgPower: parseFloat((powers.reduce((a, b) => a + b, 0) / powers.length).toFixed(2)),
+        maxPower: Math.max(...powers),
+        minPower: Math.min(...powers),
+        totalEnergyChange: energies.length > 1 ? 
+          parseFloat((energies[energies.length - 1] - energies[0]).toFixed(6)) : 0,
+        energyPerHour: energies.length > 1 && totalHours > 0 ?
+          parseFloat(((energies[energies.length - 1] - energies[0]) / totalHours).toFixed(6)) : 0
+      };
+      
+      // 🔥 DETECTAR PATRONES DE CONSUMO
+      const hourlyPatterns = {};
+      const dayOfWeekPatterns = {};
+      
+      readings.forEach(reading => {
+        const date = new Date(reading.timestamp);
+        const hour = date.getHours();
+        const day = date.getDay(); // 0 = domingo, 6 = sábado
+        const power = reading.power || 0;
+        
+        if (!hourlyPatterns[hour]) {
+          hourlyPatterns[hour] = { sum: 0, count: 0 };
+        }
+        hourlyPatterns[hour].sum += power;
+        hourlyPatterns[hour].count++;
+        
+        if (!dayOfWeekPatterns[day]) {
+          dayOfWeekPatterns[day] = { sum: 0, count: 0 };
+        }
+        dayOfWeekPatterns[day].sum += power;
+        dayOfWeekPatterns[day].count++;
+      });
+      
+      // Calcular promedios
+      analysis.patterns.hourly = {};
+      analysis.patterns.daily = {};
+      
+      Object.keys(hourlyPatterns).forEach(hour => {
+        analysis.patterns.hourly[hour] = parseFloat(
+          (hourlyPatterns[hour].sum / hourlyPatterns[hour].count).toFixed(1)
+        );
+      });
+      
+      Object.keys(dayOfWeekPatterns).forEach(day => {
+        analysis.patterns.daily[day] = parseFloat(
+          (dayOfWeekPatterns[day].sum / dayOfWeekPatterns[day].count).toFixed(1)
+        );
+      });
+      
+      // 🔥 IDENTIFICAR HORAS PICO
+      const hourlyAverages = Object.values(analysis.patterns.hourly);
+      const avgAllHours = hourlyAverages.reduce((a, b) => a + b, 0) / hourlyAverages.length;
+      const peakThreshold = avgAllHours * 1.5;
+      
+      analysis.patterns.peakHours = Object.keys(analysis.patterns.hourly)
+        .filter(hour => analysis.patterns.hourly[hour] > peakThreshold)
+        .map(hour => parseInt(hour));
+        
+      analysis.patterns.offPeakHours = Object.keys(analysis.patterns.hourly)
+        .filter(hour => analysis.patterns.hourly[hour] < (avgAllHours * 0.5))
+        .map(hour => parseInt(hour));
+      
+    } else if (dataSource.includes("historicos_compactos")) {
+      // 🔥 ANÁLISIS CON DATOS AGREGADOS
+      const consumos = historicalData.map(h => h.consumo_total_kwh || 0);
+      const potencias = historicalData.map(h => h.potencia_promedio_w || 0);
+      
+      analysis.statistics = {
+        avgConsumption: parseFloat((consumos.reduce((a, b) => a + b, 0) / consumos.length).toFixed(6)),
+        avgPower: parseFloat((potencias.reduce((a, b) => a + b, 0) / potencias.length).toFixed(1)),
+        maxConsumption: Math.max(...consumos),
+        minConsumption: Math.min(...consumos),
+        totalConsumption: parseFloat(consumos.reduce((a, b) => a + b, 0).toFixed(6))
+      };
+    }
+    
+    // 🔥 6. CÁLCULO DEL PRONÓSTICO
+    const tarifaPorKwh = 0.50; // S/ por kWh
+    let forecast = {
+      nextHour: {},
+      next24Hours: {},
+      nextWeek: {},
+      confidence: parseFloat(confidence),
+      algorithm: dataSource === "lecturas_raw" ? "ARIMA-Simple (con lecturas raw)" : "Moving Average (con agregados)"
+    };
+    
+    // Pronóstico para la próxima hora
+    if (analysis.statistics.energyPerHour) {
+      // Usar tasa por hora calculada de lecturas raw
+      forecast.nextHour = {
+        consumption: parseFloat(analysis.statistics.energyPerHour.toFixed(6)),
+        cost: parseFloat((analysis.statistics.energyPerHour * tarifaPorKwh).toFixed(4)),
+        power: parseFloat(analysis.statistics.avgPower.toFixed(1)),
+        unit: "kWh"
+      };
+    } else if (analysis.statistics.avgConsumption) {
+      // Usar promedio de consumos horarios
+      forecast.nextHour = {
+        consumption: parseFloat(analysis.statistics.avgConsumption.toFixed(6)),
+        cost: parseFloat((analysis.statistics.avgConsumption * tarifaPorKwh).toFixed(4)),
+        power: parseFloat(analysis.statistics.avgPower.toFixed(1)),
+        unit: "kWh"
+      };
+    } else {
+      // Estimación básica
+      const estimatedHourly = (analysis.statistics.avgPower || 0) / 1000; // W a kW
+      forecast.nextHour = {
+        consumption: parseFloat(estimatedHourly.toFixed(6)),
+        cost: parseFloat((estimatedHourly * tarifaPorKwh).toFixed(4)),
+        power: analysis.statistics.avgPower || 0,
+        unit: "kWh",
+        note: "Estimado basado en potencia promedio"
+      };
+    }
+    
+    // Pronóstico para las próximas 24 horas
+    if (analysis.patterns && analysis.patterns.hourly) {
+      // 🔥 PRONÓSTICO INTELIGENTE usando patrones horarios
+      const now = new Date();
+      const currentHour = now.getHours();
+      
+      let total24h = 0;
+      const hourlyForecast = {};
+      
+      // Pronosticar las próximas 24 horas usando el patrón histórico
+      for (let i = 0; i < 24; i++) {
+        const forecastHour = (currentHour + i) % 24;
+        const hourPattern = analysis.patterns.hourly[forecastHour] || analysis.statistics.avgPower || 0;
+        const hourConsumption = hourPattern / 1000; // W a kW
+        
+        hourlyForecast[forecastHour] = {
+          consumption: parseFloat(hourConsumption.toFixed(6)),
+          cost: parseFloat((hourConsumption * tarifaPorKwh).toFixed(4)),
+          isPeak: analysis.patterns.peakHours?.includes(forecastHour) || false,
+          isOffPeak: analysis.patterns.offPeakHours?.includes(forecastHour) || false
+        };
+        
+        total24h += hourConsumption;
+      }
+      
+      forecast.next24Hours = {
+        consumption: parseFloat(total24h.toFixed(6)),
+        cost: parseFloat((total24h * tarifaPorKwh).toFixed(2)),
+        hourlyBreakdown: hourlyForecast,
+        peakHours: analysis.patterns.peakHours || [],
+        offPeakHours: analysis.patterns.offPeakHours || [],
+        recommendation: analysis.patterns.peakHours?.length > 0 ?
+          `Reduce consumo entre ${analysis.patterns.peakHours.join(':00, ')}:00 para ahorrar` :
+          "Consumo estable, no hay horas pico identificadas"
+      };
+    } else {
+      // Pronóstico simple
+      const dailyConsumption = forecast.nextHour.consumption * 24;
+      forecast.next24Hours = {
+        consumption: parseFloat(dailyConsumption.toFixed(6)),
+        cost: parseFloat((dailyConsumption * tarifaPorKwh).toFixed(2)),
+        note: "Pronóstico lineal basado en promedio horario"
+      };
+    }
+    
+    // Pronóstico para la próxima semana
+    forecast.nextWeek = {
+      consumption: parseFloat((forecast.next24Hours.consumption * 7).toFixed(6)),
+      cost: parseFloat((forecast.next24Hours.cost * 7).toFixed(2)),
+      monthlyProjection: parseFloat((forecast.next24Hours.consumption * 30).toFixed(6)),
+      monthlyCost: parseFloat((forecast.next24Hours.cost * 30).toFixed(2))
+    };
+    
+    // 🔥 7. RECOMENDACIONES INTELIGENTES
+    const recommendations = [];
+    
+    if (analysis.patterns && analysis.patterns.peakHours && analysis.patterns.peakHours.length > 0) {
+      recommendations.push({
+        type: "energy_saving",
+        priority: "high",
+        title: "Optimiza consumo en horas pico",
+        description: `Tu consumo aumenta entre las ${analysis.patterns.peakHours.join(':00, ')}:00. Considera desplazar uso a horas valle.`,
+        potentialSavings: `Hasta S/ ${(forecast.next24Hours.cost * 0.15).toFixed(2)} por semana`
+      });
+    }
+    
+    if (analysis.statistics.avgPower > 100) {
+      recommendations.push({
+        type: "efficiency",
+        priority: "medium",
+        title: "Considera electrodomésticos eficientes",
+        description: `Tu potencia promedio (${analysis.statistics.avgPower.toFixed(1)}W) es alta. Electrodomésticos clase A+ pueden reducir consumo.`,
+        potentialSavings: `Hasta 30% de ahorro energético`
+      });
+    }
+    
+    if (forecast.nextWeek.monthlyCost > 50) {
+      recommendations.push({
+        type: "solar",
+        priority: "low",
+        title: "Evaluar paneles solares",
+        description: `Tu consumo mensual proyectado (${forecast.nextWeek.monthlyCost.toFixed(2)} soles) justifica evaluación de energía solar.`,
+        potentialSavings: `Hasta 70% de ahorro con inversión a mediano plazo`
+      });
+    }
+    
+    // 🔥 8. RESPUESTA COMPLETA
+    res.json({
+      success: true,
+      deviceId: deviceId,
+      deviceName: device.name,
+      deviceType: device.type || "General",
+      forecast: forecast,
+      analysis: analysis,
+      recommendations: recommendations,
+      dataQuality: {
+        source: dataSource,
+        readings: totalReadings,
+        confidence: forecast.confidence,
+        isRawData: dataSource === "lecturas_raw",
+        note: dataSource === "lecturas_raw" ? 
+          "Pronóstico basado en análisis detallado de lecturas raw" :
+          "Pronóstico basado en datos agregados"
+      },
+      timestamp: new Date().toISOString(),
+      message: `Pronóstico generado usando ${dataSource} (${totalReadings} datos)`
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/price-forecast/:deviceId", e.message);
+    console.error(e.stack);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message,
+      details: process.env.NODE_ENV === 'development' ? e.stack : undefined
+    });
+  }
+});
 
 // 📍 ENDPOINT: Recomendación solar mejorada
 app.get("/api/solar-recommendation/:deviceId", async (req, res) => {
