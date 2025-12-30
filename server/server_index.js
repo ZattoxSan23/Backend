@@ -220,6 +220,319 @@ async function createDeviceInSupabase(deviceData) {
   }
 }
 
+// 📍 NUEVA FUNCIÓN MEJORADA: Verificar y generar resumen diario con reset de energía
+async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp) {
+  try {
+    const now = new Date(currentTimestamp);
+    const currentHour = now.getHours();
+    const currentMinute = now.getMinutes();
+    const todayStr = now.toISOString().split('T')[0];
+    
+    // 🔥 Obtener el estado actual del dispositivo
+    const deviceState = onlineDevices[deviceId];
+    if (!deviceState) return;
+
+    // 🔥 Verificar si YA existe un registro para hoy en historicos_compactos
+    const { data: existingToday, error: checkError } = await supabase
+      .from("historicos_compactos")
+      .select("id, fecha_inicio, has_data")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .eq("fecha_inicio", todayStr)
+      .single();
+
+    // Si es la PRIMERA lectura del día (entre 00:00 y 00:05) y no existe registro para hoy
+    if (currentHour === 0 && currentMinute <= 5 && (!existingToday || checkError?.code === 'PGRST116')) {
+      console.log(`🔄 [NUEVO-DIA] ${deviceId}: ¡Nuevo día detectado! ${todayStr}`);
+      
+      // 1. Obtener la fecha de ayer
+      const yesterday = new Date(now);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = yesterday.toISOString().split('T')[0];
+      
+      // 2. Buscar el último registro de ayer en lecturas_raw
+      const { data: yesterdayLastReading, error: yesterdayError } = await supabase
+        .from("lecturas_raw")
+        .select("*")
+        .eq("device_id", deviceId)
+        .gte("timestamp", `${yesterdayStr}T00:00:00`)
+        .lt("timestamp", `${yesterdayStr}T23:59:59`)
+        .order("timestamp", { ascending: false })
+        .limit(1)
+        .single();
+
+      if (!yesterdayError && yesterdayLastReading) {
+        // 3. Calcular consumo del día anterior (diferencia entre primera y última lectura)
+        const { data: yesterdayFirstReading, error: firstError } = await supabase
+          .from("lecturas_raw")
+          .select("energy")
+          .eq("device_id", deviceId)
+          .gte("timestamp", `${yesterdayStr}T00:00:00`)
+          .lt("timestamp", `${yesterdayStr}T23:59:59`)
+          .order("timestamp", { ascending: true })
+          .limit(1)
+          .single();
+
+        if (!firstError && yesterdayFirstReading) {
+          const consumoKwh = yesterdayLastReading.energy - yesterdayFirstReading.energy;
+          
+          // 4. Obtener estadísticas del día anterior
+          const { data: stats, error: statsError } = await supabase
+            .from("lecturas_raw")
+            .select(`
+              max(power) as max_power,
+              avg(power) as avg_power,
+              count(*) as total_readings,
+              min(timestamp) as first_reading,
+              max(timestamp) as last_reading
+            `)
+            .eq("device_id", deviceId)
+            .gte("timestamp", `${yesterdayStr}T00:00:00`)
+            .lt("timestamp", `${yesterdayStr}T23:59:59`)
+            .single();
+
+          if (!statsError && stats) {
+            const potenciaPico = stats.max_power || 0;
+            const potenciaPromedio = stats.avg_power || 0;
+            const totalReadings = stats.total_readings || 0;
+            
+            // Calcular horas de uso
+            let horasUso = 0;
+            if (stats.first_reading && stats.last_reading) {
+              const timeDiffMs = new Date(stats.last_reading) - new Date(stats.first_reading);
+              horasUso = timeDiffMs / (1000 * 60 * 60); // ms a horas
+            }
+
+            const costoEstimado = consumoKwh * 0.50;
+            
+            // Determinar categoría
+            let categoria = 'B';
+            if (potenciaPromedio >= 100) categoria = 'A';
+            else if (potenciaPromedio >= 50) categoria = 'M';
+            else if (potenciaPromedio < 10) categoria = 'C';
+
+            // 5. Insertar en historicos_compactos
+            const { error: insertError } = await supabase
+              .from("historicos_compactos")
+              .upsert({
+                device_id: deviceId,
+                tipo_periodo: 'D',
+                fecha_inicio: yesterdayStr,
+                consumo_total_kwh: parseFloat(Math.max(0, consumoKwh).toFixed(6)),
+                potencia_pico_w: Math.round(potenciaPico),
+                potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
+                horas_uso_estimadas: parseFloat(horasUso.toFixed(2)),
+                costo_estimado: parseFloat(costoEstimado.toFixed(4)),
+                dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
+                eficiencia_categoria: categoria,
+                timestamp_creacion: new Date().toISOString(),
+                has_data: true,
+                raw_readings_count: totalReadings,
+                auto_generated: true,
+                retroactively_generated: false
+              }, {
+                onConflict: 'device_id,tipo_periodo,fecha_inicio'
+              });
+
+            if (!insertError) {
+              console.log(`✅ [NUEVO-DIA] ${deviceId}: Resumen creado para ${yesterdayStr} (${consumoKwh.toFixed(6)} kWh, ${totalReadings} lecturas)`);
+              
+              // 6. ELIMINAR LECTURAS RAW DEL DÍA ANTERIOR
+              const { error: deleteError } = await supabase
+                .from("lecturas_raw")
+                .delete()
+                .eq("device_id", deviceId)
+                .gte("timestamp", `${yesterdayStr}T00:00:00`)
+                .lt("timestamp", `${yesterdayStr}T23:59:59`);
+
+              if (!deleteError) {
+                console.log(`🧹 [NUEVO-DIA] ${deviceId}: Lecturas raw de ${yesterdayStr} eliminadas (${totalReadings} registros)`);
+              }
+
+              // 7. Resetear energía acumulada para el nuevo día
+              onlineDevices[deviceId].energy = yesterdayLastReading.energy;
+              onlineDevices[deviceId].calculationData.lastSavedEnergy = yesterdayLastReading.energy;
+              onlineDevices[deviceId].calculationData.totalEnergyAccumulated = yesterdayLastReading.energy;
+              
+              // 8. Actualizar el dispositivo con la energía inicial del nuevo día
+              const { data: deviceInDb } = await supabase
+                .from("devices")
+                .select("id")
+                .eq("esp32_id", deviceId)
+                .single();
+                
+              if (deviceInDb) {
+                await supabase
+                  .from("devices")
+                  .update({
+                    energy: yesterdayLastReading.energy,
+                    total_energy: yesterdayLastReading.energy,
+                    energy_at_day_start: yesterdayLastReading.energy,
+                    last_energy_update: new Date().toISOString()
+                  })
+                  .eq("id", deviceInDb.id);
+              }
+            }
+          }
+        }
+      }
+
+      // 9. Crear registro VACÍO para hoy en historicos_compactos
+      await supabase
+        .from("historicos_compactos")
+        .upsert({
+          device_id: deviceId,
+          tipo_periodo: 'D',
+          fecha_inicio: todayStr,
+          consumo_total_kwh: 0,
+          potencia_pico_w: 0,
+          potencia_promedio_w: 0,
+          horas_uso_estimadas: 0,
+          costo_estimado: 0,
+          dias_alto_consumo: 0,
+          eficiencia_categoria: 'N',
+          timestamp_creacion: new Date().toISOString(),
+          has_data: false,
+          raw_readings_count: 0,
+          auto_generated: true,
+          is_today: true,
+          energy_start: deviceState?.energy || 0
+        }, {
+          onConflict: 'device_id,tipo_periodo,fecha_inicio'
+        });
+        
+      console.log(`📝 [NUEVO-DIA] ${deviceId}: Registro vacío creado para hoy (${todayStr})`);
+    }
+    
+    // 🔥 Si ya existe registro para hoy, actualizar energía acumulada
+    else if (existingToday && !existingToday.has_data) {
+      // Actualizar el registro con datos actuales
+      const currentEnergy = deviceState.energy || 0;
+      const energyStart = existingToday.energy_start || currentEnergy;
+      const consumoHastaAhora = Math.max(0, currentEnergy - energyStart);
+      
+      await supabase
+        .from("historicos_compactos")
+        .update({
+          consumo_total_kwh: parseFloat(consumoHastaAhora.toFixed(6)),
+          potencia_pico_w: Math.max(existingToday.potencia_pico_w || 0, deviceState.lastPower || 0),
+          potencia_promedio_w: existingToday.potencia_promedio_w || parseFloat((deviceState.lastPower || 0).toFixed(2)),
+          has_data: true,
+          raw_readings_count: (existingToday.raw_readings_count || 0) + 1,
+          updated_at: new Date().toISOString()
+        })
+        .eq("id", existingToday.id);
+    }
+
+  } catch (e) {
+    console.error(`💥 [NUEVO-DIA] ${deviceId}: Error:`, e.message);
+  }
+}
+
+// 📍 FUNCIÓN: Procesar cambio de día FORZADO (para pruebas)
+async function forceDayChange(deviceId) {
+  try {
+    console.log(`🔄 [FORCE-DAY-CHANGE] Forzando cambio de día para ${deviceId}`);
+    
+    const now = new Date();
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
+    const todayStr = now.toISOString().split('T')[0];
+    
+    // 1. Verificar si ya hay datos de ayer
+    const { data: existingYesterday, error: checkError } = await supabase
+      .from("historicos_compactos")
+      .select("id")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .eq("fecha_inicio", yesterdayStr)
+      .single();
+    
+    // Si no existe, generarlo
+    if (!existingYesterday || checkError?.code === 'PGRST116') {
+      // Obtener datos de lecturas_raw de ayer
+      const { data: yesterdayStats, error: statsError } = await supabase
+        .from("lecturas_raw")
+        .select(`
+          min(energy) as min_energy,
+          max(energy) as max_energy,
+          max(power) as max_power,
+          avg(power) as avg_power,
+          count(*) as total_readings
+        `)
+        .eq("device_id", deviceId)
+        .gte("timestamp", `${yesterdayStr}T00:00:00`)
+        .lt("timestamp", `${yesterdayStr}T23:59:59`)
+        .single();
+      
+      if (!statsError && yesterdayStats && yesterdayStats.total_readings > 0) {
+        const consumoKwh = (yesterdayStats.max_energy - yesterdayStats.min_energy);
+        
+        await supabase
+          .from("historicos_compactos")
+          .upsert({
+            device_id: deviceId,
+            tipo_periodo: 'D',
+            fecha_inicio: yesterdayStr,
+            consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)),
+            potencia_pico_w: Math.round(yesterdayStats.max_power),
+            potencia_promedio_w: parseFloat(yesterdayStats.avg_power.toFixed(2)),
+            horas_uso_estimadas: 24,
+            costo_estimado: parseFloat((consumoKwh * 0.50).toFixed(4)),
+            dias_alto_consumo: yesterdayStats.max_power > 1000 ? 1 : 0,
+            eficiencia_categoria: 'B',
+            has_data: true,
+            raw_readings_count: yesterdayStats.total_readings,
+            auto_generated: true
+          }, {
+            onConflict: 'device_id,tipo_periodo,fecha_inicio'
+          });
+        
+        console.log(`✅ [FORCE-DAY-CHANGE] ${deviceId}: Resumen creado para ${yesterdayStr}`);
+        
+        // Eliminar lecturas raw de ayer
+        await supabase
+          .from("lecturas_raw")
+          .delete()
+          .eq("device_id", deviceId)
+          .gte("timestamp", `${yesterdayStr}T00:00:00`)
+          .lt("timestamp", `${yesterdayStr}T23:59:59`);
+          
+        console.log(`🧹 [FORCE-DAY-CHANGE] ${deviceId}: Lecturas raw de ${yesterdayStr} eliminadas`);
+      }
+    }
+    
+    // 2. Crear registro vacío para hoy
+    await supabase
+      .from("historicos_compactos")
+      .upsert({
+        device_id: deviceId,
+        tipo_periodo: 'D',
+        fecha_inicio: todayStr,
+        consumo_total_kwh: 0,
+        potencia_pico_w: 0,
+        potencia_promedio_w: 0,
+        horas_uso_estimadas: 0,
+        costo_estimado: 0,
+        dias_alto_consumo: 0,
+        eficiencia_categoria: 'N',
+        has_data: false,
+        raw_readings_count: 0,
+        auto_generated: true,
+        is_today: true
+      }, {
+        onConflict: 'device_id,tipo_periodo,fecha_inicio'
+      });
+    
+    console.log(`📝 [FORCE-DAY-CHANGE] ${deviceId}: Registro vacío creado para hoy (${todayStr})`);
+    
+  } catch (e) {
+    console.error(`💥 [FORCE-DAY-CHANGE] ${deviceId}:`, e.message);
+  }
+}
+
 // 🔥 ACTUALIZACIÓN MEJORADA: Más campos y precisión
 async function updateDeviceInSupabase(deviceId, updates) {
   try {
@@ -989,11 +1302,86 @@ function scheduleOptimizedTasks() {
 }
 
 
+// 📍 ENDPOINT: Ver estado de procesamiento diario
+app.get("/api/day-status/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    
+    const today = new Date().toISOString().split('T')[0];
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
+    
+    // Verificar registros en historicos_compactos
+    const { data: todayRecord } = await supabase
+      .from("historicos_compactos")
+      .select("*")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .eq("fecha_inicio", today)
+      .single();
+    
+    const { data: yesterdayRecord } = await supabase
+      .from("historicos_compactos")
+      .select("*")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .eq("fecha_inicio", yesterdayStr)
+      .single();
+    
+    // Contar lecturas raw de hoy y ayer
+    const { count: todayRawCount } = await supabase
+      .from("lecturas_raw")
+      .select("*", { count: 'exact', head: true })
+      .eq("device_id", deviceId)
+      .gte("timestamp", `${today}T00:00:00`)
+      .lt("timestamp", `${today}T23:59:59`);
+    
+    const { count: yesterdayRawCount } = await supabase
+      .from("lecturas_raw")
+      .select("*", { count: 'exact', head: true })
+      .eq("device_id", deviceId)
+      .gte("timestamp", `${yesterdayStr}T00:00:00`)
+      .lt("timestamp", `${yesterdayStr}T23:59:59`);
+    
+    res.json({
+      success: true,
+      deviceId: deviceId,
+      today: {
+        date: today,
+        hasRecord: !!todayRecord,
+        recordData: todayRecord,
+        rawReadings: todayRawCount || 0
+      },
+      yesterday: {
+        date: yesterdayStr,
+        hasRecord: !!yesterdayRecord,
+        recordData: yesterdayRecord,
+        rawReadings: yesterdayRawCount || 0
+      },
+      onlineState: onlineDevices[deviceId] ? {
+        energy: onlineDevices[deviceId].energy,
+        lastSeen: new Date(onlineDevices[deviceId].lastSeen).toISOString(),
+        lastDayChange: onlineDevices[deviceId].lastDayChange ? 
+          new Date(onlineDevices[deviceId].lastDayChange).toISOString() : null
+      } : null,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (e) {
+    console.error("💥 /api/day-status/:deviceId", e.message);
+    res.status(500).json({ 
+      success: false, 
+      error: e.message 
+    });
+  }
+});
+
 
 
 // ====== ENDPOINTS MEJORADOS CON SSID ======
 
-// 📍 ENDPOINT: Recibir datos de ESP32 - CON DETECCIÓN DE CAMBIO DE DÍA
+// 📍 ENDPOINT: Recibir datos de ESP32 - CON DETECCIÓN MEJORADA
 app.post("/api/data", async (req, res) => {
   try {
     const {
@@ -1031,21 +1419,22 @@ app.post("/api/data", async (req, res) => {
     // 🔥 INICIALIZAR O ACTUALIZAR ESTADO DEL DISPOSITIVO CON SSID
     const deviceState = initializeDeviceState(deviceId, deviceInDb, wifiSsid);
 
-    // 🔥 DETECTAR SI CAMBIÓ EL DÍA (comparar con última lectura)
-    if (deviceState.lastTs) {
-      const lastDate = new Date(deviceState.lastTs);
-      const currentDate = new Date(now);
-      
-      // 🔥 Si cambió el día (00:00 pasó)
-      if (
-        lastDate.getDate() !== currentDate.getDate() ||
-        lastDate.getMonth() !== currentDate.getMonth() ||
-        lastDate.getFullYear() !== currentDate.getFullYear()
-      ) {
-        console.log(`🔄 [DAY-CHANGE] ${deviceId}: Cambió de día!`);
+    // 🔥 DETECTAR SI CAMBIÓ EL DÍA (00:00 - 00:05)
+    const currentHour = nowDate.getHours();
+    const currentMinute = nowDate.getMinutes();
+    
+    if (currentHour === 0 && currentMinute <= 5) {
+      // Verificar si ya hemos procesado el cambio de día hoy
+      if (!deviceState.lastDayChange || 
+          new Date(deviceState.lastDayChange).getDate() !== nowDate.getDate()) {
         
-        // 🔥 Generar resumen del día anterior automáticamente
-        await checkAndGenerateDailySummary(deviceId, now);
+        console.log(`🔄 [DIA-DETECTADO] ${deviceId}: Procesando cambio de día...`);
+        
+        // 🔥 Generar resumen del día anterior
+        await checkAndGenerateDailySummaryOptimized(deviceId, now);
+        
+        // Marcar que ya procesamos el cambio de día hoy
+        onlineDevices[deviceId].lastDayChange = now;
       }
     }
 
@@ -1121,6 +1510,7 @@ app.post("/api/data", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 // 📍 ENDPOINT: Generar resúmenes para días pasados específicos
 app.post("/api/generate-daily-for-period", async (req, res) => {
