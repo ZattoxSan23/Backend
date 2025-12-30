@@ -1,6 +1,10 @@
-// server_index.js - VERSIÓN COMPLETA CON RECOLECCIÓN AUTOMÁTICA
+// server_index.js - VERSIÓN CORREGIDA CON HORA PERUANA Y LIMPIEZA AUTOMÁTICA
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
+
+// ✅ CONFIGURACIÓN DE HORA PERUANA (UTC-5)
+process.env.TZ = 'America/Lima';
+console.log(`⏰ Configurando hora peruana: ${new Date().toString()}`);
 
 // ✅ CORRECTO - Usa variables de entorno
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://rrqxllucpihrcxeaossl.supabase.co";
@@ -11,36 +15,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const moment = require('moment-timezone');
-
-// Configurar zona horaria de Perú
-const PERU_TIMEZONE = 'America/Lima';
-
-// 🔥 FUNCIONES DE FECHA/HORA PERÚ
-function getPeruTime() {
-  return moment().tz(PERU_TIMEZONE);
-}
-
-function getPeruDateString() {
-  return getPeruTime().format('YYYY-MM-DD');
-}
-
-function getPeruDateTimeString() {
-  return getPeruTime().format('YYYY-MM-DD HH:mm:ss');
-}
-
-function getPeruTimestamp() {
-  return getPeruTime().valueOf();
-}
-
-function formatPeruDate(date) {
-  return moment(date).tz(PERU_TIMEZONE).format('YYYY-MM-DD');
-}
-
-function isPeruMidnight() {
-  const peruNow = getPeruTime();
-  return peruNow.hour() === 0 && peruNow.minute() <= 5;
-}
 
 // Tiempo de espera para considerar OFFLINE (5 segundos)
 const ONLINE_TIMEOUT_MS = 5000;
@@ -49,23 +23,25 @@ const ONLINE_TIMEOUT_MS = 5000;
 const onlineDevices = {}; // { deviceId: { lastSeen, lastPower, energy, lastTs, wifiSsid, networkCode, ... } }
 
 const DATA_CONFIG = {
-  saveEveryNReadings: 6,
-  keepRawDataDays: 1,
-  dailySummaryHour: 23,
+  saveEveryNReadings: 6,           // Guardar 1 de cada 6 lecturas (cada ~30s)
+  keepRawDataDays: 1,              // Mantener lecturas_raw por 1 día (después de procesar)
+  dailySummaryHour: 23,            // Generar resumen diario a las 23:00 hora Perú
   dailySummaryMinute: 59,
-  generateHourlySummary: false,
-  generateWeeklySummary: true,
-  generateMonthlySummary: true,
-  autoDetectDayChange: true,
-  minReadingsForDaily: 2,
-  // ✅ NUEVO: Configuración Perú
-  peruTimezone: 'America/Lima',
-  autoDeleteOldRawData: true,
-  cleanupTime: { hour: 0, minute: 5 }, // 00:05 Perú
-  resetSequenceDaily: false
+  generateHourlySummary: false,    // ❌ DESHABILITADO: Generar resumen por hora
+  generateWeeklySummary: true,     // Generar resumen semanal
+  generateMonthlySummary: true,    // Generar resumen mensual
+  autoDetectDayChange: true,       // Detectar automáticamente cambio de día
+  minReadingsForDaily: 2,          // Mínimo de lecturas para considerar "con datos"
+  cleanupHour: 0,                  // Limpiar datos a las 00:05 hora Perú
+  cleanupMinute: 5,
 };
+
 // Contadores por dispositivo para controlar frecuencia
 const deviceCounters = {};
+
+// ✅ VARIABLE GLOBAL PARA CONTROLAR EJECUCIÓN ÚNICA
+let dailySummaryExecuted = false;
+let cleanupExecuted = false;
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -318,7 +294,7 @@ app.get("/api/current-day-stats/:deviceId", async (req, res) => {
   }
 });
 
-// 📍 FUNCIÓN MEJORADA: Verificar y generar resumen diario con actualización en tiempo real
+// 🔥 CORREGIDO: Verificar y generar resumen diario con actualización en tiempo real
 async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp) {
   try {
     const now = new Date(currentTimestamp);
@@ -530,10 +506,12 @@ async function updateDeviceInSupabase(deviceId, updates) {
   }
 }
 
-// ====== FUNCIONES DE RECOLECCIÓN AUTOMÁTICA ======
-// 📍 FUNCIÓN OPTIMIZADA: Guardar lectura con fecha Perú
-async function saveToLecturasRawOptimized(deviceId, data, finalEnergy, timestamp = null) {
+// ====== FUNCIONES DE RECOLECCIÓN Y LIMPIEZA AUTOMÁTICA ======
+
+// 📍 FUNCIÓN CORREGIDA: Guardar lectura con frecuencia controlada Y ACTUALIZAR ESTADÍSTICAS
+async function saveToLecturasRawOptimized(deviceId, data, finalEnergy) {
   try {
+    // 🔥 CONTROL DE FRECUENCIA: Solo guardar 1 de cada N lecturas
     if (!deviceCounters[deviceId]) {
       deviceCounters[deviceId] = 0;
     }
@@ -541,9 +519,11 @@ async function saveToLecturasRawOptimized(deviceId, data, finalEnergy, timestamp
     deviceCounters[deviceId]++;
 
     if (deviceCounters[deviceId] % DATA_CONFIG.saveEveryNReadings !== 0) {
+      // No guardar esta vez
       return false;
     }
 
+    // Resetear contador si es muy grande
     if (deviceCounters[deviceId] > 1000) {
       deviceCounters[deviceId] = 0;
     }
@@ -559,81 +539,74 @@ async function saveToLecturasRawOptimized(deviceId, data, finalEnergy, timestamp
       return false;
     }
 
-    // 🔥 USAR TIMESTAMP PERÚ
-    const saveTimestamp = timestamp || getPeruTime().toISOString();
-    const todayPeru = getPeruDateString();
-
-    // 🔥 GUARDAR con timestamp y fecha Perú
+    // 🔥 GUARDAR con campos optimizados
     const { error: insertError } = await supabase
       .from("lecturas_raw")
       .insert({
         device_id: deviceId,
-        power: Math.round(data.power),
-        energy: parseFloat(finalEnergy.toFixed(4)),
-        voltage: Math.round(data.voltage),
-        current: parseFloat(data.current.toFixed(3)),
-        timestamp: saveTimestamp,
-        peru_date: todayPeru
+        power: Math.round(data.power),      // SMALLINT
+        energy: parseFloat(finalEnergy.toFixed(4)), // 4 decimales
+        voltage: Math.round(data.voltage),  // SMALLINT
+        current: parseFloat(data.current.toFixed(3)), // 3 decimales
+        timestamp: new Date().toISOString()
       });
 
     if (insertError) {
-      console.error(`❌ [RAW-DATA-PERU] ${deviceId}:`, insertError.message);
+      console.error(`❌ [RAW-DATA] ${deviceId}:`, insertError.message);
       return false;
     }
 
     // 🔥 ACTUALIZAR ESTADÍSTICAS DEL DÍA CADA 10 LECTURAS
     if (deviceCounters[deviceId] % (DATA_CONFIG.saveEveryNReadings * 10) === 0) {
       const now = Date.now();
+      const todayStr = new Date().toISOString().split('T')[0];
       await updateDailyStatsInRealTime(deviceId, {
         power: data.power,
         energy: finalEnergy,
         timestamp: now,
-        todayStr: todayPeru
+        todayStr: todayStr
       });
     }
 
-    // LOG reducido
+    // 🔥 LOG reducido (solo cada 10 inserciones)
     if (deviceCounters[deviceId] % (DATA_CONFIG.saveEveryNReadings * 10) === 0) {
-      console.log(`💾 [RAW-DATA-PERU] ${deviceId}: Guardado #${deviceCounters[deviceId]}, fecha: ${todayPeru}`);
+      console.log(`💾 [RAW-DATA] ${deviceId}: Guardado (${deviceCounters[deviceId]} lecturas procesadas)`);
     }
 
     return true;
   } catch (e) {
-    console.error(`💥 [RAW-DATA-PERU] ${deviceId}:`, e.message);
+    console.error(`💥 [RAW-DATA] ${deviceId}:`, e.message);
     return false;
   }
 }
 
-// 📍 ENDPOINT: Ver estadísticas del día actual en tiempo real (Perú)
+// 📍 ENDPOINT: Ver estadísticas del día actual en tiempo real
 app.get("/api/today-stats/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const todayPeru = getPeruDateString();
+    const todayStr = new Date().toISOString().split('T')[0];
     
     const { data: dayStats, error } = await supabase
       .from("historicos_compactos")
       .select("*")
       .eq("device_id", deviceId)
       .eq("tipo_periodo", 'D')
-      .eq("fecha_inicio", todayPeru)
+      .eq("fecha_inicio", todayStr)
       .single();
     
     if (error) {
       return res.json({
         success: true,
         has_data: false,
-        message: "Aún no hay datos para hoy en Perú",
+        message: "Aún no hay datos para hoy",
         deviceId: deviceId,
-        today: todayPeru,
-        peru_time: getPeruDateTimeString(),
-        peru_timestamp: getPeruTimestamp()
+        today: todayStr
       });
     }
     
     // Calcular estadísticas adicionales
-    const peruNow = getPeruTime();
-    const horasTranscurridas = peruNow.hour() + (peruNow.minute() / 60);
-    const proyeccionDiaria = dayStats.consumo_total_kwh * (24 / Math.max(1, horasTranscurridas));
+    const horasTranscurridas = new Date().getHours() + (new Date().getMinutes() / 60);
+    const proyeccionDiaria = dayStats.consumo_total_kwh * (24 / horasTranscurridas);
     
     res.json({
       success: true,
@@ -645,8 +618,6 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
         proyeccion_costo: parseFloat((proyeccionDiaria * 0.50).toFixed(2))
       },
       message: `Datos actualizados: ${dayStats.raw_readings_count || 0} lecturas procesadas`,
-      peru_date: todayPeru,
-      peru_time: getPeruDateTimeString(),
       last_updated: dayStats.updated_at || dayStats.timestamp_creacion
     });
     
@@ -659,16 +630,60 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
   }
 });
 
-// 📍 FUNCIÓN MEJORADA: Generar resumen diario con fechas Perú
+// 🔥 CORREGIDO: Función de limpieza automática de datos antiguos
+async function cleanupOldRawData() {
+  try {
+    const now = new Date();
+    console.log(`🧹 [CLEANUP-AUTO] Iniciando limpieza automática a las ${now.toLocaleTimeString()}`);
+    
+    // Calcular fecha de corte (hoy - keepRawDataDays)
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - DATA_CONFIG.keepRawDataDays);
+    const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+    
+    console.log(`🧹 [CLEANUP-AUTO] Eliminando lecturas_raw anteriores a: ${cutoffDateStr}`);
+    
+    // 🔥 ELIMINAR TODAS LAS LECTURAS RAW DE DÍAS ANTERIORES
+    const { error: deleteError, count } = await supabase
+      .from("lecturas_raw")
+      .delete()
+      .lt("timestamp", `${cutoffDateStr}T23:59:59`);
+    
+    if (deleteError) {
+      console.error(`❌ [CLEANUP-AUTO] Error eliminando lecturas antiguas:`, deleteError.message);
+    } else {
+      console.log(`✅ [CLEANUP-AUTO] Limpieza completada. Eliminadas lecturas anteriores a ${cutoffDateStr}`);
+    }
+    
+    // 🔥 También eliminar registros históricos de días anteriores (opcional)
+    const { error: deleteHistError } = await supabase
+      .from("historicos_compactos")
+      .delete()
+      .lt("fecha_inicio", cutoffDateStr)
+      .eq("tipo_periodo", 'D');
+    
+    if (!deleteHistError) {
+      console.log(`🧹 [CLEANUP-AUTO] También eliminados historicos_compactos antiguos`);
+    }
+    
+    cleanupExecuted = true;
+    
+  } catch (e) {
+    console.error(`💥 [CLEANUP-AUTO] Error en limpieza:`, e.message);
+  }
+}
+
+// 🔥 CORREGIDO: Generar resumen diario con detección de cambio de día
 async function generateDailySummaryOptimized() {
   try {
-    // 🔥 Usar fecha Perú
-    const peruToday = getPeruTime();
-    const peruYesterday = peruToday.clone().subtract(1, 'days');
-    const yesterdayStr = peruYesterday.format('YYYY-MM-DD');
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = yesterday.toISOString().split('T')[0];
 
-    console.log(`📊 [DAILY-SUMMARY-PERU] Generando para ${yesterdayStr}...`);
+    console.log(`📊 [DAILY-SUMMARY] Generando para ${yesterdayStr}...`);
 
+    // 🔥 Obtener TODOS los dispositivos registrados (no solo los que tuvieron actividad)
     const { data: allDevices, error: devicesError } = await supabase
       .from("devices")
       .select("esp32_id")
@@ -679,17 +694,18 @@ async function generateDailySummaryOptimized() {
       return;
     }
 
-    console.log(`📊 [DAILY-SUMMARY] Procesando ${allDevices.length} dispositivos`);
+    console.log(`📊 [DAILY-SUMMARY] Procesando ${allDevices.length} dispositivos registrados`);
 
     let processed = 0;
     let errors = 0;
     let skippedNoData = 0;
 
+    // 🔥 Procesar CADA DISPOSITIVO registrado
     const promises = allDevices.map(async (device) => {
       try {
         const esp32Id = device.esp32_id;
 
-        // 🔥 Buscar lecturas raw de AYER en Perú
+        // 🔥 CONSULTA MEJORADA: Buscar lecturas raw de YESTERDAY, sin importar si son pocas
         const { data: stats, error: statsError } = await supabase
           .from("lecturas_raw")
           .select(`
@@ -706,6 +722,8 @@ async function generateDailySummaryOptimized() {
           .lt("timestamp", `${yesterdayStr}T23:59:59`)
           .single();
 
+        // 🔥 CORRECCIÓN: Si hay error o no hay datos, DEJAMOS el registro con 0 o null
+        // PERO SIEMPRE creamos una entrada para el día
         let consumoKwh = 0;
         let potenciaPico = 0;
         let potenciaPromedio = 0;
@@ -720,28 +738,31 @@ async function generateDailySummaryOptimized() {
           totalReadings = parseInt(stats.total_readings || 0);
           hasData = true;
 
+          // 🔥 CÁLCULO MEJORADO de horas de uso
           if (stats.first_reading && stats.last_reading && totalReadings >= 2) {
             const timeDiffMs = new Date(stats.last_reading) - new Date(stats.first_reading);
             const timeDiffHours = timeDiffMs / (1000 * 60 * 60);
-            horasUso = Math.min(timeDiffHours, 24);
+            horasUso = Math.min(timeDiffHours, 24); // Máximo 24 horas
           }
         } else {
+          // 🔥 CREAMOS REGISTRO CON 0s si no hay datos
           console.log(`ℹ️ [DAILY-SUMMARY] ${esp32Id}: Sin lecturas en ${yesterdayStr}`);
           skippedNoData++;
         }
 
         const costoEstimado = consumoKwh * 0.50;
 
+        // 🔥 Categoría inteligente (basada en datos reales o por defecto)
         let categoria = 'B';
         if (hasData) {
           if (potenciaPromedio >= 100) categoria = 'A';
           else if (potenciaPromedio >= 50) categoria = 'M';
           else if (potenciaPromedio < 10) categoria = 'C';
         } else {
-          categoria = 'N';
+          categoria = 'N'; // N = No data
         }
 
-        // 🔥 INSERT/UPDATE con fecha Perú
+        // 🔥 INSERT/UPDATE en historicos_compactos - SIEMPRE
         const { error: upsertError } = await supabase
           .from("historicos_compactos")
           .upsert({
@@ -755,10 +776,9 @@ async function generateDailySummaryOptimized() {
             costo_estimado: parseFloat(costoEstimado.toFixed(4)),
             dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
             eficiencia_categoria: categoria,
-            timestamp_creacion: getPeruTime().toISOString(),
+            timestamp_creacion: new Date().toISOString(),
             has_data: hasData,
-            raw_readings_count: totalReadings,
-            peru_date: yesterdayStr
+            raw_readings_count: totalReadings
           }, {
             onConflict: 'device_id,tipo_periodo,fecha_inicio'
           });
@@ -771,15 +791,28 @@ async function generateDailySummaryOptimized() {
 
         processed++;
 
+        // 🔥 Solo actualizar devices si hubo datos
         if (hasData && totalReadings > 0) {
           await supabase
             .from("devices")
             .update({
               daily_consumption: consumoKwh,
               last_daily_summary: yesterdayStr,
-              updated_at: getPeruTime().toISOString()
+              updated_at: new Date().toISOString()
             })
             .eq("esp32_id", esp32Id);
+        }
+
+        // 🔥 ELIMINAR LECTURAS RAW DE AYER PARA ESTE DISPOSITIVO
+        const { error: deleteError } = await supabase
+          .from("lecturas_raw")
+          .delete()
+          .eq("device_id", esp32Id)
+          .gte("timestamp", `${yesterdayStr}T00:00:00`)
+          .lt("timestamp", `${yesterdayStr}T23:59:59`);
+
+        if (!deleteError) {
+          console.log(`🧹 [DAILY-SUMMARY] ${esp32Id}: Eliminadas lecturas raw de ${yesterdayStr}`);
         }
 
         return {
@@ -796,46 +829,80 @@ async function generateDailySummaryOptimized() {
       }
     });
 
+    // Esperar todas las promesas
     await Promise.all(promises);
 
-    // 🔥 LIMPIEZA: Solo eliminar datos de ayer (Perú)
-    const peruYesterdayForDelete = getPeruTime().subtract(1, 'days');
-    const yesterdayDeleteStr = peruYesterdayForDelete.format('YYYY-MM-DD');
+    // 🔥 LIMPIEZA ADICIONAL: Borrar lecturas_raw antiguas
+    await cleanupOldRawData();
 
-    console.log(`🧹 [DAILY-CLEANUP] Eliminando lecturas_raw de ${yesterdayDeleteStr}...`);
-
-    const { error: deleteError, count: deletedCount } = await supabase
-      .from("lecturas_raw")
-      .delete()
-      .gte("timestamp", `${yesterdayDeleteStr}T00:00:00`)
-      .lt("timestamp", `${yesterdayDeleteStr}T23:59:59`);
-
-    if (!deleteError) {
-      console.log(`✅ [DAILY-CLEANUP] ${deletedCount || 0} lecturas_raw eliminadas`);
-    } else {
-      console.warn(`⚠️ [DAILY-CLEANUP] Error:`, deleteError.message);
+    // 🔥 Generar resumen SEMANAL si es domingo
+    if (yesterday.getDay() === 0) { // 0 = domingo
+      await generateWeeklySummaryOptimized(yesterday);
     }
 
-    // 🔥 Generar resumen SEMANAL si es domingo en Perú
-    if (peruYesterday.day() === 0) {
-      await generateWeeklySummaryOptimized(peruYesterday.toDate());
+    // 🔥 Generar resumen MENSUAL si es último día del mes
+    const tomorrow = new Date(yesterday);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (tomorrow.getDate() === 1) { // Mañana es día 1
+      await generateMonthlySummaryOptimized(yesterday);
     }
 
-    // 🔥 Generar resumen MENSUAL si es último día del mes en Perú
-    const tomorrow = peruYesterday.clone().add(1, 'days');
-    if (tomorrow.date() === 1) {
-      await generateMonthlySummaryOptimized(peruYesterday.toDate());
-    }
-
-    console.log(`✅ [DAILY-SUMMARY-PERU] COMPLETADO: ${processed} procesados, ${skippedNoData} sin datos, ${errors} errores`);
+    console.log(`✅ [DAILY-SUMMARY] COMPLETADO: ${processed} procesados, ${skippedNoData} sin datos, ${errors} errores`);
+    dailySummaryExecuted = true;
 
   } catch (e) {
-    console.error(`💥 [DAILY-SUMMARY-PERU] Error general:`, e.message);
+    console.error(`💥 [DAILY-SUMMARY] Error general:`, e.message);
     console.error(e.stack);
   }
 }
 
+// 📍 FUNCIÓN: Generar resumen semanal
+async function generateWeeklySummaryOptimized(lastDayOfWeek) {
+  try {
+    const weekStart = new Date(lastDayOfWeek);
+    weekStart.setDate(weekStart.getDate() - 6); // Retroceder 6 días para empezar la semana
+    const weekStartStr = weekStart.toISOString().split('T')[0];
 
+    console.log(`🗓️ [WEEKLY-SUMMARY] Generando para semana ${weekStartStr}`);
+
+    // 🔥 Agregar datos semanales
+    const { data: weeklyData, error } = await supabase
+      .from("historicos_compactos")
+      .select(`
+        device_id,
+        sum(consumo_total_kwh) as total_kwh,
+        max(potencia_pico_w) as max_pico,
+        avg(potencia_promedio_w) as avg_potencia
+      `)
+      .eq("tipo_periodo", 'D')
+      .gte("fecha_inicio", weekStartStr)
+      .lte("fecha_inicio", lastDayOfWeek.toISOString().split('T')[0])
+      .group("device_id");
+
+    if (error || !weeklyData) return;
+
+    for (const item of weeklyData) {
+      await supabase
+        .from("historicos_compactos")
+        .upsert({
+          device_id: item.device_id,
+          tipo_periodo: 'W', // Semanal
+          fecha_inicio: weekStartStr,
+          consumo_total_kwh: parseFloat(item.total_kwh.toFixed(3)),
+          potencia_pico_w: item.max_pico,
+          potencia_promedio_w: parseFloat(item.avg_potencia.toFixed(2)),
+          timestamp_creacion: new Date().toISOString()
+        }, {
+          onConflict: 'device_id,tipo_periodo,fecha_inicio'
+        });
+    }
+
+    console.log(`✅ [WEEKLY-SUMMARY] ${weeklyData.length} dispositivos procesados`);
+
+  } catch (e) {
+    console.error(`💥 [WEEKLY-SUMMARY] Error:`, e.message);
+  }
+}
 
 // 📍 FUNCIÓN: Generar resumen mensual
 async function generateMonthlySummaryOptimized(lastDayOfMonth) {
@@ -893,8 +960,6 @@ async function generateMonthlySummaryOptimized(lastDayOfMonth) {
   }
 }
 
-
-
 // ====== FUNCIONES DE MANTENIMIENTO ======
 async function cleanupOnlineStatus() {
   const now = Date.now();
@@ -927,52 +992,6 @@ async function cleanupOnlineStatus() {
     }
   }
 }
-
-// 📍 ENDPOINT: Forzar limpieza de lecturas_raw
-app.post("/api/force-cleanup-raw", async (req, res) => {
-  try {
-    const { date } = req.body;
-    
-    let targetDate;
-    if (date) {
-      targetDate = moment.tz(date, 'YYYY-MM-DD', PERU_TIMEZONE);
-    } else {
-      targetDate = getPeruTime().subtract(1, 'days');
-    }
-    
-    const dateStr = targetDate.format('YYYY-MM-DD');
-    
-    console.log(`🧹 [FORCE-CLEANUP] Eliminando lecturas_raw del ${dateStr}`);
-    
-    const { count, error } = await supabase
-      .from("lecturas_raw")
-      .delete()
-      .gte("timestamp", `${dateStr}T00:00:00`)
-      .lt("timestamp", `${dateStr}T23:59:59`);
-    
-    if (error) {
-      return res.status(500).json({
-        success: false,
-        error: error.message
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: `Eliminadas ${count || 0} lecturas_raw del ${dateStr}`,
-      date: dateStr,
-      peru_time: getPeruDateTimeString(),
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (e) {
-    console.error("💥 /api/force-cleanup-raw", e.message);
-    res.status(500).json({
-      success: false,
-      error: e.message
-    });
-  }
-});
 
 // 📍 ENDPOINT: Forzar generación de datos históricos
 app.post("/api/force-generate-historical/:deviceId", async (req, res) => {
@@ -1078,119 +1097,58 @@ app.post("/api/force-generate-historical/:deviceId", async (req, res) => {
   }
 });
 
-// 🔥 NUEVA FUNCIÓN: Limpiar lecturas_raw del día anterior
-async function cleanupYesterdayRawData() {
-  try {
-    const peruYesterday = getPeruTime().subtract(1, 'days');
-    const yesterdayStr = peruYesterday.format('YYYY-MM-DD');
-    
-    console.log(`🧹 [CLEANUP-DAILY] Eliminando lecturas_raw de: ${yesterdayStr}`);
-
-    const { error: deleteError, count } = await supabase
-      .from("lecturas_raw")
-      .delete()
-      .gte("timestamp", `${yesterdayStr}T00:00:00`)
-      .lt("timestamp", `${yesterdayStr}T23:59:59`);
-
-    if (deleteError) {
-      console.error(`❌ [CLEANUP-DAILY] Error:`, deleteError.message);
-      return false;
-    }
-
-    console.log(`✅ [CLEANUP-DAILY] ${count || 0} lecturas_raw eliminadas del ${yesterdayStr}`);
-
-    // 🔥 Opcional: Resetear secuencia si es necesario
-    if (DATA_CONFIG.resetSequenceDaily) {
-      try {
-        const { error: resetError } = await supabase.rpc('reset_lecturas_raw_sequence');
-        if (!resetError) {
-          console.log(`🔄 [CLEANUP-DAILY] Secuencia resetada`);
-        }
-      } catch (e) {
-        console.log(`ℹ️ [CLEANUP-DAILY] No se pudo resetear secuencia`);
-      }
-    }
-
-    return true;
-  } catch (e) {
-    console.error(`💥 [CLEANUP-DAILY] Error:`, e.message);
-    return false;
-  }
-}
+// 🔥 CORREGIDO: Programación de tareas optimizadas con hora peruana
 function scheduleOptimizedTasks() {
-  console.log("⏰ [SCHEDULER-PERU] Iniciando programación en zona horaria Perú...");
+  console.log("⏰ [SCHEDULER] Iniciando programación de tareas optimizadas...");
+  console.log(`⏰ Hora actual del servidor: ${new Date().toString()}`);
   
-  const peruNow = getPeruTime();
-  console.log(`🇵🇪 [SCHEDULER] Hora Perú: ${peruNow.format('YYYY-MM-DD HH:mm:ss')}`);
+  // 🔥 Programar resumen diario a las 23:59 hora Perú
+  const now = new Date();
+  const targetTimeDaily = new Date(now);
+  targetTimeDaily.setHours(DATA_CONFIG.dailySummaryHour, DATA_CONFIG.dailySummaryMinute, 0, 0);
 
-  // 🔥 1. Programar resumen diario a las 23:59 Perú
-  const targetTimeDaily = peruNow.clone().set({
-    hour: DATA_CONFIG.dailySummaryHour,
-    minute: DATA_CONFIG.dailySummaryMinute,
-    second: 0,
-    millisecond: 0
-  });
-
-  if (peruNow.isAfter(targetTimeDaily)) {
-    targetTimeDaily.add(1, 'days');
+  if (now > targetTimeDaily) {
+    targetTimeDaily.setDate(targetTimeDaily.getDate() + 1);
   }
 
-  const msUntilDaily = targetTimeDaily.diff(peruNow);
+  const msUntilDaily = targetTimeDaily.getTime() - now.getTime();
+
+  console.log(`⏰ [SCHEDULER] Resumen diario programado para: ${targetTimeDaily.toLocaleTimeString()} (en ${Math.round(msUntilDaily / 1000 / 60)} minutos)`);
 
   setTimeout(() => {
     console.log("🔄 [SCHEDULER] Ejecutando resumen diario programado...");
     generateDailySummaryOptimized();
-    
+    // Repetir cada 24 horas
     setInterval(() => {
-      console.log("🔄 [SCHEDULER] Ejecutando resumen diario (intervalo 24h)...");
+      console.log("🔄 [SCHEDULER] Ejecutando resumen diario programado (intervalo)...");
       generateDailySummaryOptimized();
     }, 24 * 60 * 60 * 1000);
   }, msUntilDaily);
 
-  console.log(`⏰ [SCHEDULER] Resumen diario: ${targetTimeDaily.format('HH:mm:ss')} Perú`);
-
-  // 🔥 2. Programar LIMPIEZA DIARIA a las 00:05 Perú
-  const targetTimeCleanup = peruNow.clone().set({
-    hour: DATA_CONFIG.cleanupTime.hour,
-    minute: DATA_CONFIG.cleanupTime.minute,
-    second: 0,
-    millisecond: 0
-  });
-
-  if (peruNow.isAfter(targetTimeCleanup)) {
-    targetTimeCleanup.add(1, 'days');
+  // 🔥 Programar limpieza automática a las 00:05 hora Perú
+  const targetTimeCleanup = new Date(now);
+  targetTimeCleanup.setHours(DATA_CONFIG.cleanupHour, DATA_CONFIG.cleanupMinute, 0, 0);
+  
+  if (now > targetTimeCleanup) {
+    targetTimeCleanup.setDate(targetTimeCleanup.getDate() + 1);
   }
-
-  const msUntilCleanup = targetTimeCleanup.diff(peruNow);
-
+  
+  const msUntilCleanup = targetTimeCleanup.getTime() - now.getTime();
+  
+  console.log(`⏰ [SCHEDULER] Limpieza automática programada para: ${targetTimeCleanup.toLocaleTimeString()} (en ${Math.round(msUntilCleanup / 1000 / 60)} minutos)`);
+  
   setTimeout(() => {
-    console.log("🧹 [SCHEDULER] Ejecutando limpieza diaria...");
-    cleanupYesterdayRawData();
-    
+    console.log("🧹 [SCHEDULER] Ejecutando limpieza automática...");
+    cleanupOldRawData();
+    // Repetir cada 24 horas
     setInterval(() => {
-      console.log("🧹 [SCHEDULER] Ejecutando limpieza diaria (intervalo 24h)...");
-      cleanupYesterdayRawData();
+      console.log("🧹 [SCHEDULER] Ejecutando limpieza automática (intervalo)...");
+      cleanupOldRawData();
     }, 24 * 60 * 60 * 1000);
   }, msUntilCleanup);
 
-  console.log(`⏰ [SCHEDULER] Limpieza diaria: ${targetTimeCleanup.format('HH:mm:ss')} Perú`);
-
-  // 🔥 3. Limpieza de seguridad cada 6 horas
-  setInterval(async () => {
-    const cutoffDate = getPeruTime().subtract(3, 'days');
-    const { error } = await supabase
-      .from("lecturas_raw")
-      .delete()
-      .lt("timestamp", cutoffDate.toISOString());
-
-    if (!error) {
-      console.log(`🧹 [CLEANUP-SEGURIDAD] Datos > 3 días eliminados`);
-    }
-  }, 6 * 60 * 60 * 1000);
-
-  console.log("✅ [SCHEDULER] Tareas programadas para Perú");
+  console.log("✅ [SCHEDULER] Tareas programadas correctamente (resumen diario y limpieza)");
 }
-
 
 // 📍 ENDPOINT: Ver estado de procesamiento diario
 app.get("/api/day-status/:deviceId", async (req, res) => {
@@ -1267,8 +1225,8 @@ app.get("/api/day-status/:deviceId", async (req, res) => {
   }
 });
 
-
-// 📍 ENDPOINT: Recibir datos de ESP32 - VERSIÓN CON FECHA PERÚ
+// ====== ENDPOINTS MEJORADOS CON SSID ======
+// 📍 ENDPOINT: Recibir datos de ESP32 - VERSIÓN CORREGIDA CON ACTUALIZACIÓN EN TIEMPO REAL
 app.post("/api/data", async (req, res) => {
   try {
     const {
@@ -1284,11 +1242,9 @@ app.post("/api/data", async (req, res) => {
 
     if (!deviceId) return res.status(400).json({ error: "Falta deviceId." });
 
-    // 🔥 USAR FECHA/HORA PERÚ
-    const peruNow = getPeruTime();
-    const now = peruNow.valueOf();
-    const todayStr = peruNow.format('YYYY-MM-DD');
-    const nowISO = peruNow.toISOString();
+    const now = Date.now();
+    const nowDate = new Date(now);
+    const todayStr = nowDate.toISOString().split('T')[0];
 
     const data = {
       voltage: +voltage || 0,
@@ -1298,7 +1254,6 @@ app.post("/api/data", async (req, res) => {
       frequency: +frequency || 0,
       powerFactor: +powerFactor || 0,
       timestamp: now,
-      peruDate: todayStr,
     };
 
     // Buscar si el dispositivo está registrado en Supabase
@@ -1344,28 +1299,28 @@ app.post("/api/data", async (req, res) => {
       todayStr: todayStr
     });
 
-    // 🔥 DETECTAR SI CAMBIÓ EL DÍA EN PERÚ (00:00 - 00:05)
-    const currentHour = peruNow.hour();
-    const currentMinute = peruNow.minute();
+    // 🔥 DETECTAR SI CAMBIÓ EL DÍA (00:00 - 00:05) HORA PERÚ
+    const currentHour = nowDate.getHours();
+    const currentMinute = nowDate.getMinutes();
 
     if (currentHour === 0 && currentMinute <= 5) {
       if (!deviceState.lastDayChange ||
-        !deviceState.lastDayChange.startsWith(todayStr)) {
+        new Date(deviceState.lastDayChange).getDate() !== nowDate.getDate()) {
 
-        console.log(`🔄 [DIA-DETECTADO-PERU] ${deviceId}: Cambio de día detectado ${todayStr}`);
+        console.log(`🔄 [DIA-DETECTADO] ${deviceId}: Procesando cambio de día...`);
         await checkAndGenerateDailySummaryOptimized(deviceId, now);
-        onlineDevices[deviceId].lastDayChange = todayStr;
+        onlineDevices[deviceId].lastDayChange = now;
       }
     }
 
-    // 🔥 GUARDAR EN lecturas_raw CON TIMESTAMP PERÚ
-    await saveToLecturasRawOptimized(deviceId, data, finalEnergy, nowISO);
+    // 🔥 GUARDAR EN lecturas_raw OPTIMIZADO
+    await saveToLecturasRawOptimized(deviceId, data, finalEnergy);
 
     // 🔥 SI ESTÁ REGISTRADO, ACTUALIZAR EN SUPABASE
     if (isRegistered && deviceDbId) {
       const updates = {
         is_online: true,
-        last_seen: nowISO,
+        last_seen: new Date().toISOString(),
         power: data.power,
         energy: finalEnergy,
         voltage: data.voltage,
@@ -1383,14 +1338,13 @@ app.post("/api/data", async (req, res) => {
       await updateDeviceInSupabase(deviceDbId, updates);
     }
 
-    // 🔥 LOG MEJORADO CON HORA PERÚ
+    // 🔥 LOG MEJORADO
     console.log(
-      `[DATA-PERU] ${deviceId} → ` +
+      `[DATA] ${deviceId} → ` +
       `WiFi: "${wifiSsid || 'No SSID'}" | ` +
       `V:${data.voltage.toFixed(1)}V  I:${data.current.toFixed(3)}A  ` +
       `P:${data.power.toFixed(1)}W  E:${finalEnergy.toFixed(6)}kWh  ` +
-      `| ${isRegistered ? "✅ REGISTRADO" : "⚠️ NO REGISTRADO"} | ` +
-      `Hora Perú: ${peruNow.format('HH:mm:ss')}`
+      `| ${isRegistered ? "✅ REGISTRADO" : "⚠️ NO REGISTRADO"}`
     );
 
     res.json({
@@ -1399,8 +1353,6 @@ app.post("/api/data", async (req, res) => {
       calculatedEnergy: finalEnergy,
       wifiSsid: wifiSsid,
       timestamp: now,
-      peruDate: todayStr,
-      peruTime: peruNow.format('HH:mm:ss')
     });
   } catch (e) {
     console.error("💥 /api/data", e.message);
@@ -1564,7 +1516,6 @@ app.post("/api/generate-daily-for-period", async (req, res) => {
     });
   }
 });
-
 
 // 📍 ENDPOINT MEJORADO: Buscar dispositivos por nombre de WiFi
 app.get("/api/devices-by-wifi", async (req, res) => {
@@ -2452,6 +2403,26 @@ app.post("/api/generate-daily-summary", async (req, res) => {
   }
 });
 
+// 📍 ENDPOINT: Forzar limpieza de datos antiguos
+app.post("/api/force-cleanup", async (req, res) => {
+  try {
+    console.log(`🧹 [FORCE-CLEANUP] Ejecutando limpieza manual...`);
+    await cleanupOldRawData();
+    
+    res.json({
+      success: true,
+      message: "Limpieza ejecutada exitosamente",
+      timestamp: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error("💥 /api/force-cleanup", e.message);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
 app.get("/api/historical-analysis/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -2599,8 +2570,6 @@ app.get("/api/historical-analysis/:deviceId", async (req, res) => {
     });
   }
 });
-
-
 
 // 🔥 ENDPOINT: Pronóstico de precio usando TODAS las lecturas raw
 app.get("/api/price-forecast/:deviceId", async (req, res) => {
@@ -2913,7 +2882,7 @@ app.get("/api/price-forecast/:deviceId", async (req, res) => {
     forecast.nextWeek = {
       consumption: parseFloat((forecast.next24Hours.consumption * 7).toFixed(6)),
       cost: parseFloat((forecast.next24Hours.cost * 7).toFixed(2)),
-      monthlyProjection: parseFloat((forecast.next24Hours.consumption * 30).toFixed(6)),
+      monthlyProjection: parseFloat((forecast.next24Hours.consumo_total_kwh * 30).toFixed(6)),
       monthlyCost: parseFloat((forecast.next24Hours.cost * 30).toFixed(2))
     };
 
@@ -2982,6 +2951,63 @@ app.get("/api/price-forecast/:deviceId", async (req, res) => {
     });
   }
 });
+
+// 📍 FUNCIÓN: Calcular recomendación solar (función auxiliar)
+async function calculateSolarRecommendation(deviceId) {
+  try {
+    const { data: stats, error } = await supabase
+      .from("historicos_compactos")
+      .select("consumo_total_kwh")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .order("fecha_inicio", { ascending: false })
+      .limit(30);
+
+    if (error || !stats || stats.length === 0) {
+      return { error: "No hay datos suficientes para calcular recomendación solar" };
+    }
+
+    const totalConsumption = stats.reduce((sum, day) => sum + (day.consumo_total_kwh || 0), 0);
+    const dailyAverage = totalConsumption / stats.length;
+    const monthlyAverage = dailyAverage * 30;
+
+    // Cálculo de paneles necesarios
+    const panelPower = 450; // W por panel
+    const sunHours = 5; // Horas de sol promedio
+    const panelDailyProduction = (panelPower / 1000) * sunHours; // kWh por panel por día
+    const panelsNeeded = Math.ceil((dailyAverage * 1.2) / panelDailyProduction); // +20% de margen
+
+    // Costo y ahorro
+    const panelCost = 150; // USD por panel
+    const installationCost = 500; // USD
+    const totalCost = (panelsNeeded * panelCost) + installationCost;
+    const monthlySavings = monthlyAverage * 0.50; // Ahorro estimado en soles (tarifa 0.50 S/ por kWh)
+    const roiMonths = Math.ceil(totalCost / (monthlySavings * 0.25)); // ROI en meses (considerando 0.25 USD por sol)
+
+    return {
+      dailyAverage: parseFloat(dailyAverage.toFixed(2)),
+      monthlyAverage: parseFloat(monthlyAverage.toFixed(2)),
+      panelsNeeded: panelsNeeded,
+      panelSpecs: {
+        power: panelPower,
+        sunHours: sunHours,
+        dailyProduction: parseFloat(panelDailyProduction.toFixed(2))
+      },
+      financials: {
+        totalCost: totalCost,
+        monthlySavings: parseFloat(monthlySavings.toFixed(2)),
+        roiMonths: roiMonths,
+        annualSavings: parseFloat((monthlySavings * 12).toFixed(2))
+      },
+      recommendation: panelsNeeded <= 2 ? 
+        "Sistema pequeño recomendado para autoconsumo" :
+        "Sistema mediano recomendado con posible inyección a red"
+    };
+  } catch (e) {
+    console.error(`💥 calculateSolarRecommendation: ${e.message}`);
+    return { error: e.message };
+  }
+}
 
 // 📍 ENDPOINT: Recomendación solar mejorada
 app.get("/api/solar-recommendation/:deviceId", async (req, res) => {
@@ -3091,22 +3117,14 @@ app.post("/api/simulate-data", async (req, res) => {
 // 📍 ENDPOINT: Limpiar datos antiguos
 app.post("/api/cleanup-old-data", async (req, res) => {
   try {
-    const { daysToKeep = 2 } = req.body;
+    const { daysToKeep = 1 } = req.body;
 
-    const cutoffDate = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000);
-
-    const { count: rawDeleted } = await supabase
-      .from("lecturas_raw")
-      .delete()
-      .lt("timestamp", cutoffDate.toISOString());
-
-    console.log(`🧹 [CLEANUP] Eliminadas ${rawDeleted} lecturas_raw > ${daysToKeep} días`);
-
+    await cleanupOldRawData();
+    
     res.json({
       success: true,
-      message: `Datos antiguos limpiados (conservando últimos ${daysToKeep} días)`,
-      lecturas_raw_eliminadas: rawDeleted || 0,
-      cutoffDate: cutoffDate.toISOString()
+      message: `Limpieza ejecutada (conservando últimos ${daysToKeep} día)`,
+      timestamp: new Date().toISOString()
     });
 
   } catch (e) {
@@ -3158,7 +3176,9 @@ app.get("/api/system-stats", async (req, res) => {
         system: {
           uptime: process.uptime(),
           memory: process.memoryUsage(),
-          nodeVersion: process.version
+          nodeVersion: process.version,
+          timezone: process.env.TZ || 'UTC',
+          serverTime: new Date().toString()
         }
       },
       timestamp: new Date().toISOString()
@@ -3177,7 +3197,9 @@ app.get("/api/system-stats", async (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     service: "ESP32 Energy Monitor API",
-    version: "3.0 - Sistema Completo con Recolección Automática",
+    version: "3.1 - Sistema Completo Corregido con Hora Peruana",
+    timezone: "America/Lima (UTC-5)",
+    serverTime: new Date().toString(),
     endpoints: {
       data: "POST /api/data - Recibir datos del ESP32",
       devicesByWifi: "GET /api/devices-by-wifi?wifiName=XXXX",
@@ -3185,15 +3207,20 @@ app.get("/", (req, res) => {
       devicesByCode: "GET /api/devices-by-code?networkCode=XXXX",
       // 🔥 NUEVOS ENDPOINTS
       generateDailySummary: "POST /api/generate-daily-summary",
+      forceCleanup: "POST /api/force-cleanup",
       historicalAnalysis: "GET /api/historical-analysis/:deviceId",
       solarRecommendation: "GET /api/solar-recommendation/:deviceId",
       simulateData: "POST /api/simulate-data",
       systemStats: "GET /api/system-stats"
     },
-    message: "Sistema completo de monitorización energética con recolección automática"
+    automation: {
+      dailySummary: `${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute} hora Perú`,
+      autoCleanup: `${DATA_CONFIG.cleanupHour}:${DATA_CONFIG.cleanupMinute} hora Perú`,
+      keepRawDataDays: DATA_CONFIG.keepRawDataDays
+    },
+    message: "Sistema completo de monitorización energética con hora peruana y limpieza automática"
   });
 });
-
 
 // 📍 ENDPOINT: Datos para gráfico tiempo real (últimas X horas)
 app.get("/api/realtime-chart/:deviceId", async (req, res) => {
@@ -3236,8 +3263,10 @@ app.get("/api/realtime-chart/:deviceId", async (req, res) => {
       });
     }
 
+    let finalReadings = realReadings || [];
+
     // 🔥 Si no hay datos recientes, usar datos del dispositivo actual
-    if (!realReadings || realReadings.length === 0) {
+    if (finalReadings.length === 0) {
       const { data: deviceData } = await supabase
         .from("devices")
         .select("power, energy, voltage, current, last_seen")
@@ -3245,7 +3274,7 @@ app.get("/api/realtime-chart/:deviceId", async (req, res) => {
         .single();
 
       if (deviceData) {
-        realReadings = [{
+        finalReadings = [{
           timestamp: deviceData.last_seen || new Date().toISOString(),
           power: deviceData.power || 0,
           energy: deviceData.energy || 0,
@@ -3258,16 +3287,16 @@ app.get("/api/realtime-chart/:deviceId", async (req, res) => {
     res.json({
       success: true,
       deviceId: deviceId,
-      readings: realReadings || [],
-      count: realReadings?.length || 0,
+      readings: finalReadings,
+      count: finalReadings.length,
       timeRange: {
         from: hoursAgo.toISOString(),
         to: new Date().toISOString(),
         hours: parseInt(hours)
       },
-      message: realReadings?.length === 0
+      message: finalReadings.length === 0
         ? "No hay lecturas recientes"
-        : `Datos reales obtenidos: ${realReadings.length} lecturas`
+        : `Datos reales obtenidos: ${finalReadings.length} lecturas`
     });
 
   } catch (e) {
@@ -3278,9 +3307,6 @@ app.get("/api/realtime-chart/:deviceId", async (req, res) => {
     });
   }
 });
-
-
-
 
 // 📍 ENDPOINT: Pronóstico de costos usando lecturas raw recientes
 app.get("/api/realtime-cost-forecast/:deviceId", async (req, res) => {
@@ -3532,27 +3558,102 @@ app.get("/api/comparative-analysis/:deviceId", async (req, res) => {
   }
 });
 
+// 🔥 FUNCIÓN INICIAL: Verificar y crear registros para hoy
+async function initializeDailyRecords() {
+  try {
+    const todayStr = new Date().toISOString().split('T')[0];
+    console.log(`📝 [INIT] Verificando registros para hoy: ${todayStr}`);
+
+    // Obtener todos los dispositivos registrados
+    const { data: devices, error } = await supabase
+      .from("devices")
+      .select("esp32_id")
+      .not("esp32_id", "is", null);
+
+    if (error || !devices || devices.length === 0) {
+      console.log(`ℹ️ [INIT] No hay dispositivos registrados`);
+      return;
+    }
+
+    console.log(`📝 [INIT] Verificando ${devices.length} dispositivos`);
+
+    for (const device of devices) {
+      const esp32Id = device.esp32_id;
+
+      // Verificar si ya existe registro para hoy
+      const { data: existing, error: checkError } = await supabase
+        .from("historicos_compactos")
+        .select("id")
+        .eq("device_id", esp32Id)
+        .eq("tipo_periodo", 'D')
+        .eq("fecha_inicio", todayStr)
+        .single();
+
+      // Si no existe, crear registro vacío
+      if (checkError && checkError.code === 'PGRST116') {
+        console.log(`📝 [INIT] Creando registro vacío para ${esp32Id} - ${todayStr}`);
+
+        await supabase
+          .from("historicos_compactos")
+          .insert({
+            device_id: esp32Id,
+            tipo_periodo: 'D',
+            fecha_inicio: todayStr,
+            consumo_total_kwh: 0,
+            potencia_pico_w: 0,
+            potencia_promedio_w: 0,
+            horas_uso_estimadas: 0,
+            costo_estimado: 0,
+            dias_alto_consumo: 0,
+            eficiencia_categoria: 'N',
+            timestamp_creacion: new Date().toISOString(),
+            has_data: false,
+            raw_readings_count: 0,
+            auto_generated: true,
+            is_today: true,
+            first_reading_time: null,
+            last_reading_time: null
+          });
+      }
+    }
+
+    console.log(`✅ [INIT] Registros diarios inicializados para ${devices.length} dispositivos`);
+  } catch (e) {
+    console.error(`💥 [INIT] Error inicializando registros:`, e.message);
+  }
+}
+
 // Iniciar la tarea periódica de limpieza de estado
 const CLEANUP_INTERVAL_MS = 2000;
 setInterval(cleanupOnlineStatus, CLEANUP_INTERVAL_MS);
 
-// 🔥 INICIAR SERVIDOR
-app.listen(PORT, "0.0.0.0", () => {
+// 🔥 INICIAR SERVIDOR CON INICIALIZACIÓN
+app.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
-  console.log(`🇵🇪 Hora Perú: ${getPeruDateTimeString()}`);
+  console.log(`⏰ Hora peruana configurada: ${new Date().toString()}`);
   console.log(`📡 Sistema COMPLETO por SSID/WIFI con RECOLECCIÓN AUTOMÁTICA`);
+  
+  // 🔥 INICIALIZAR REGISTROS DIARIOS
+  await initializeDailyRecords();
+  
+  // 🔥 EJECUTAR LIMPIEZA INICIAL DE DATOS ANTERIORES
+  console.log("🧹 [INIT] Ejecutando limpieza inicial de datos antiguos...");
+  await cleanupOldRawData();
+  
   console.log(`🔗 Endpoints principales:`);
   console.log(`   GET  /api/devices-by-wifi?wifiName=TU_WIFI`);
   console.log(`   POST /api/register-simple (deviceId, deviceName, wifiSsid)`);
   console.log(`   GET  /api/devices-by-code?networkCode=XXXX`);
   console.log(`   POST /api/data (para ESP32)`);
-  console.log(`📊 Sistema de RECOLECCIÓN AUTOMÁTICA (PERÚ):`);
-  console.log(`   ⏰ Resumen diario: ${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute} cada día`);
-  console.log(`   🧹 Limpieza automática: ${DATA_CONFIG.cleanupTime.hour}:${DATA_CONFIG.cleanupTime.minute} cada día`);
-  console.log(`   💾 Guarda 1 de cada ${DATA_CONFIG.saveEveryNReadings} lecturas`);
+  console.log(`📊 Sistema de RECOLECCIÓN AUTOMÁTICA activado`);
+  console.log(`   ⏰ Resumen diario: ${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute} hora Perú`);
+  console.log(`   🧹 Limpieza automática: ${DATA_CONFIG.cleanupHour}:${DATA_CONFIG.cleanupMinute} hora Perú`);
+  console.log(`   💾 Guarda 1 de cada ${DATA_CONFIG.saveEveryNReadings} lecturas (cada ~${DATA_CONFIG.saveEveryNReadings * 5}s)`);
+  console.log(`   📅 Mantiene ${DATA_CONFIG.keepRawDataDays} día(s) de lecturas raw`);
   console.log(`📈 Endpoints de análisis:`);
-  console.log(`   GET  /api/today-stats/:deviceId (fecha Perú)`);
-  console.log(`   POST /api/force-cleanup-raw (limpieza manual)`);
+  console.log(`   GET  /api/historical-analysis/:deviceId`);
+  console.log(`   GET  /api/solar-recommendation/:deviceId`);
+  console.log(`   POST /api/force-cleanup (limpieza manual)`);
   console.log(`⏰ Cleanup interval: ${CLEANUP_INTERVAL_MS}ms`);
 
   // 🔥 INICIAR TAREAS PROGRAMADAS
