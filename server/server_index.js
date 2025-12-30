@@ -18,13 +18,12 @@ const ONLINE_TIMEOUT_MS = 5000;
 // 🔥 ESTRUCTURA MEJORADA CON SSID
 const onlineDevices = {}; // { deviceId: { lastSeen, lastPower, energy, lastTs, wifiSsid, networkCode, ... } }
 
-// ====== CONFIGURACIÓN DE RECOLECCIÓN ======
 const DATA_CONFIG = {
   saveEveryNReadings: 6,           // Guardar 1 de cada 6 lecturas (cada ~30s)
   keepRawDataDays: 1,              // Mantener lecturas_raw por 1 día (después de procesar)
   dailySummaryHour: 23,            // Generar resumen diario a las 23:00
   dailySummaryMinute: 59,
-  generateHourlySummary: true,     // Generar resumen por hora
+  generateHourlySummary: false,    // ❌ DESHABILITADO: Generar resumen por hora
   generateWeeklySummary: true,     // Generar resumen semanal
   generateMonthlySummary: true,    // Generar resumen mensual
   autoDetectDayChange: true,       // Detectar automáticamente cambio de día
@@ -485,7 +484,7 @@ async function generateDailySummaryOptimized() {
   }
 }
 
-// 📍 FUNCIÓN NUEVA: Detectar y generar resumen cuando cambia el día
+// 📍 FUNCIÓN MEJORADA: Detectar y generar resumen cuando cambia el día
 async function checkAndGenerateDailySummary(deviceId, currentTimestamp) {
   try {
     const now = new Date(currentTimestamp);
@@ -500,20 +499,20 @@ async function checkAndGenerateDailySummary(deviceId, currentTimestamp) {
       .eq("fecha_inicio", todayStr)
       .single();
 
-    if (checkError && checkError.code !== 'PGRST116') { // PGRST116 = no rows
+    // Si hay error diferente a "no encontrado", registrar y continuar
+    if (checkError && checkError.code !== 'PGRST116') {
       console.warn(`⚠️ [DAY-CHECK] ${deviceId}: Error verificando día`, checkError.message);
-      return;
     }
 
-    // 🔥 Si NO existe registro para hoy, verificar si hay datos de AYER
-    if (!existingToday) {
+    // 🔥 Si NO existe registro para hoy, procesar día anterior
+    if (!existingToday || checkError?.code === 'PGRST116') {
       const yesterday = new Date(now);
       yesterday.setDate(yesterday.getDate() - 1);
       const yesterdayStr = yesterday.toISOString().split('T')[0];
       
       console.log(`🔄 [DAY-CHECK] ${deviceId}: Cambió de día! Generando resumen para ${yesterdayStr}`);
       
-      // 🔥 Generar resumen para AYER con los datos que haya
+      // 🔥 1. Obtener datos del día anterior
       const { data: yesterdayStats, error: yesterdayError } = await supabase
         .from("lecturas_raw")
         .select(`
@@ -537,6 +536,7 @@ async function checkAndGenerateDailySummary(deviceId, currentTimestamp) {
       let totalReadings = 0;
       let hasData = false;
 
+      // 🔥 2. Procesar datos si existen
       if (!yesterdayError && yesterdayStats && yesterdayStats.total_readings > 0) {
         consumoKwh = (parseFloat(yesterdayStats.max_energy || 0) - parseFloat(yesterdayStats.min_energy || 0));
         potenciaPico = parseFloat(yesterdayStats.max_power || 0);
@@ -544,25 +544,26 @@ async function checkAndGenerateDailySummary(deviceId, currentTimestamp) {
         totalReadings = parseInt(yesterdayStats.total_readings || 0);
         hasData = true;
         
+        // Calcular horas de uso reales
         if (yesterdayStats.first_reading && yesterdayStats.last_reading && totalReadings >= 2) {
           const timeDiffMs = new Date(yesterdayStats.last_reading) - new Date(yesterdayStats.first_reading);
           const timeDiffHours = timeDiffMs / (1000 * 60 * 60);
-          horasUso = Math.min(timeDiffHours, 24);
+          horasUso = Math.min(Math.max(timeDiffHours, 0.1), 24); // Mínimo 0.1 horas, máximo 24
         }
       }
 
       const costoEstimado = consumoKwh * 0.50;
       
-      let categoria = 'B';
+      // 🔥 3. Determinar categoría de eficiencia
+      let categoria = 'N'; // Por defecto: No data
       if (hasData) {
         if (potenciaPromedio >= 100) categoria = 'A';
         else if (potenciaPromedio >= 50) categoria = 'M';
-        else if (potenciaPromedio < 10) categoria = 'C';
-      } else {
-        categoria = 'N'; // No data
+        else if (potenciaPromedio >= 10) categoria = 'B';
+        else categoria = 'C';
       }
 
-      // 🔥 Insertar resumen de AYER
+      // 🔥 4. Insertar resumen del día anterior
       const { error: insertError } = await supabase
         .from("historicos_compactos")
         .upsert({
@@ -585,9 +586,23 @@ async function checkAndGenerateDailySummary(deviceId, currentTimestamp) {
         });
 
       if (!insertError) {
-        console.log(`✅ [DAY-CHECK] ${deviceId}: Resumen generado para ${yesterdayStr} (${totalReadings} lecturas)`);
+        console.log(`✅ [DAY-CHECK] ${deviceId}: Resumen generado para ${yesterdayStr} (${totalReadings} lecturas, ${consumoKwh.toFixed(6)} kWh)`);
         
-        // 🔥 Crear registro VACÍO para hoy (para tracking)
+        // 🔥 5. ELIMINAR LECTURAS RAW DEL DÍA ANTERIOR
+        const { error: deleteError } = await supabase
+          .from("lecturas_raw")
+          .delete()
+          .eq("device_id", deviceId)
+          .gte("timestamp", `${yesterdayStr}T00:00:00`)
+          .lt("timestamp", `${yesterdayStr}T23:59:59`);
+
+        if (!deleteError) {
+          console.log(`🧹 [DAY-CHECK] ${deviceId}: Lecturas raw de ${yesterdayStr} eliminadas (${totalReadings} registros)`);
+        } else {
+          console.warn(`⚠️ [DAY-CHECK] ${deviceId}: Error eliminando lecturas raw:`, deleteError.message);
+        }
+        
+        // 🔥 6. Crear registro inicial para hoy (vacío)
         await supabase
           .from("historicos_compactos")
           .upsert({
@@ -604,16 +619,27 @@ async function checkAndGenerateDailySummary(deviceId, currentTimestamp) {
             timestamp_creacion: new Date().toISOString(),
             has_data: false,
             raw_readings_count: 0,
-            auto_generated: true
+            auto_generated: true,
+            is_today: true
           }, {
             onConflict: 'device_id,tipo_periodo,fecha_inicio'
           });
+          
+        console.log(`📝 [DAY-CHECK] ${deviceId}: Registro creado para hoy (${todayStr})`);
+        
+      } else {
+        console.error(`❌ [DAY-CHECK] ${deviceId}: Error insertando resumen:`, insertError.message);
       }
+    } else {
+      // Si ya existe registro para hoy, solo registrar que estamos activos
+      console.log(`ℹ️ [DAY-CHECK] ${deviceId}: Ya tiene registro para hoy (${todayStr})`);
     }
   } catch (e) {
-    console.error(`💥 [DAY-CHECK] ${deviceId}:`, e.message);
+    console.error(`💥 [DAY-CHECK] ${deviceId}: Error general:`, e.message);
+    console.error(e.stack);
   }
 }
+
 
 // 📍 FUNCIÓN: Generar resumen semanal
 async function generateWeeklySummaryOptimized(lastDayOfWeek) {
@@ -916,38 +942,11 @@ app.post("/api/force-generate-historical/:deviceId", async (req, res) => {
   }
 });
 
-// 🔥 REEMPLAZAR LA FUNCIÓN scheduleOptimizedTasks() con esta versión
 function scheduleOptimizedTasks() {
   console.log("⏰ [SCHEDULER] Iniciando programación de tareas optimizadas...");
   
-  // 🔥 1. Ejecutar resumen por hora INMEDIATAMENTE (para datos pendientes)
-  console.log("🔄 Ejecutando resumen por hora inicial...");
-  generateHourlySummaryOptimized();
-  
-  // 🔥 2. Programar resumen por hora CADA HORA en punto
+  // 🔥 Programar resumen diario
   const now = new Date();
-  const nextHour = new Date(now);
-  nextHour.setHours(nextHour.getHours() + 1);
-  nextHour.setMinutes(0, 0, 0); // En punto
-  
-  const msUntilNextHour = nextHour.getTime() - now.getTime();
-  
-  console.log(`⏰ Programando resumen por hora para: ${nextHour.getHours()}:00 (en ${Math.round(msUntilNextHour/1000/60)} minutos)`);
-  
-  setTimeout(() => {
-    // Primera ejecución en la hora en punto
-    generateHourlySummaryOptimized();
-    
-    // Programar cada hora (60 minutos * 60 segundos * 1000 ms)
-    const hourlyInterval = setInterval(generateHourlySummaryOptimized, 60 * 60 * 1000);
-    
-    // Guardar referencia para posible limpieza
-    global.hourlyInterval = hourlyInterval;
-    
-    console.log("✅ [SCHEDULER] Resumen por hora programado CADA HORA");
-  }, msUntilNextHour);
-  
-  // 🔥 3. Programar resumen diario
   const targetTimeDaily = new Date(now);
   targetTimeDaily.setHours(DATA_CONFIG.dailySummaryHour, DATA_CONFIG.dailySummaryMinute, 0, 0);
   
@@ -958,136 +957,39 @@ function scheduleOptimizedTasks() {
   const msUntilDaily = targetTimeDaily.getTime() - now.getTime();
   
   setTimeout(() => {
+    console.log("🔄 [SCHEDULER] Ejecutando resumen diario programado...");
     generateDailySummaryOptimized();
     // Repetir cada 24 horas
-    setInterval(generateDailySummaryOptimized, 24 * 60 * 60 * 1000);
+    setInterval(() => {
+      console.log("🔄 [SCHEDULER] Ejecutando resumen diario programado (intervalo)...");
+      generateDailySummaryOptimized();
+    }, 24 * 60 * 60 * 1000);
   }, msUntilDaily);
   
-  console.log(`⏰ [SCHEDULER] Resumen diario a las ${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute}`);
+  console.log(`⏰ [SCHEDULER] Resumen diario programado para: ${DATA_CONFIG.dailySummaryHour}:${DATA_CONFIG.dailySummaryMinute} (en ${Math.round(msUntilDaily/1000/60)} minutos)`);
   
-  // 🔥 4. Programar limpieza de datos antiguos cada 6 horas
+  // 🔥 Programar limpieza de datos antiguos cada 6 horas
   setInterval(async () => {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - DATA_CONFIG.keepRawDataDays);
     
-    const { error: deleteError } = await supabase
+    const { error: deleteError, count } = await supabase
       .from("lecturas_raw")
       .delete()
       .lt("timestamp", cutoffDate.toISOString());
 
     if (!deleteError) {
       console.log(`🧹 [CLEANUP] Lecturas_raw > ${DATA_CONFIG.keepRawDataDays} días eliminadas`);
+    } else {
+      console.warn(`⚠️ [CLEANUP] Error eliminando lecturas antiguas:`, deleteError.message);
     }
   }, 6 * 60 * 60 * 1000); // Cada 6 horas
   
-  console.log("✅ [SCHEDULER] Todas las tareas programadas correctamente");
+  console.log("✅ [SCHEDULER] Tareas programadas correctamente (solo diario y limpieza)");
 }
 
-// 🔥 ENDPOINT: Forzar generación de resumen por hora
-app.post("/api/force-hourly-summary", async (req, res) => {
-  try {
-    const { deviceId, specificHour } = req.body;
-    
-    console.log(`🔄 [FORCE-HOURLY] Solicitado por API${deviceId ? ` para dispositivo ${deviceId}` : ''}`);
-    
-    if (deviceId) {
-      // Generar solo para un dispositivo específico
-      const now = new Date();
-      const targetHour = specificHour ? 
-        new Date(specificHour) : 
-        new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours() - 1);
-      
-      const dateStr = targetHour.toISOString().split('T')[0];
-      const hour = targetHour.getHours();
-      
-      // Obtener datos del dispositivo
-      const { data: stats, error: statsError } = await supabase
-        .from("lecturas_raw")
-        .select(`
-          min(energy) as min_energy,
-          max(energy) as max_energy,
-          max(power) as max_power,
-          avg(power) as avg_power,
-          count(*) as total_readings
-        `)
-        .eq("device_id", deviceId)
-        .gte("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`)
-        .lt("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:59:59`)
-        .single();
-      
-      if (statsError || !stats || stats.total_readings < 2) {
-        return res.status(404).json({
-          success: false,
-          error: `No hay suficientes lecturas raw para ${deviceId} en hora ${hour}:00`
-        });
-      }
-      
-      const consumoKwh = (parseFloat(stats.max_energy) - parseFloat(stats.min_energy));
-      const potenciaPico = parseInt(stats.max_power) || 0;
-      const potenciaPromedio = parseFloat(stats.avg_power) || 0;
-      const tarifaPorKwh = 0.50;
-      const costoEstimado = consumoKwh * tarifaPorKwh;
-      
-      let categoria = 'B';
-      if (potenciaPromedio >= 100) categoria = 'A';
-      else if (potenciaPromedio >= 50) categoria = 'M';
-      else if (potenciaPromedio < 10) categoria = 'C';
-      
-      const fechaHoraInicio = `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`;
-      
-      const { error: upsertError } = await supabase
-        .from("historicos_compactos")
-        .upsert({
-          device_id: deviceId,
-          tipo_periodo: 'H',
-          fecha_inicio: fechaHoraInicio,
-          consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)),
-          potencia_pico_w: Math.round(potenciaPico),
-          potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
-          horas_uso_estimadas: 1.0,
-          costo_estimado: parseFloat(costoEstimado.toFixed(4)),
-          dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
-          eficiencia_categoria: categoria,
-          timestamp_creacion: new Date().toISOString()
-        }, {
-          onConflict: 'device_id,tipo_periodo,fecha_inicio'
-        });
-      
-      if (upsertError) {
-        throw new Error(upsertError.message);
-      }
-      
-      res.json({
-        success: true,
-        message: `Resumen por hora generado para ${deviceId} (${hour}:00)`,
-        deviceId: deviceId,
-        hour: `${hour}:00`,
-        date: dateStr,
-        consumption: parseFloat(consumoKwh.toFixed(6)),
-        cost: parseFloat(costoEstimado.toFixed(4)),
-        readings: stats.total_readings,
-        timestamp: new Date().toISOString()
-      });
-      
-    } else {
-      // Generar para TODOS los dispositivos
-      await generateHourlySummaryOptimized();
-      
-      res.json({
-        success: true,
-        message: "Resumen por hora generado para todos los dispositivos",
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-  } catch (e) {
-    console.error("💥 /api/force-hourly-summary", e.message);
-    res.status(500).json({ 
-      success: false, 
-      error: e.message 
-    });
-  }
-});
+
+
 
 // ====== ENDPOINTS MEJORADOS CON SSID ======
 
@@ -2412,162 +2314,6 @@ app.get("/api/historical-analysis/:deviceId", async (req, res) => {
   }
 });
 
-// 🔥 CORRECCIÓN: GENERAR RESUMEN POR HORA CON LECTURAS RAW - VERSIÓN MEJORADA
-async function generateHourlySummaryOptimized() {
-  try {
-    const now = new Date();
-    const previousHour = new Date(now);
-    previousHour.setHours(previousHour.getHours() - 1);
-    
-    const dateStr = previousHour.toISOString().split('T')[0];
-    const hour = previousHour.getHours();
-    
-    console.log(`⏰ [HOURLY-SUMMARY] Generando para ${dateStr} ${hour}:00:00`);
-    
-    // 🔥 1. Obtener TODOS los dispositivos que tienen lecturas_raw en la hora anterior
-    const { data: activeDevices, error } = await supabase
-      .from("lecturas_raw")
-      .select("device_id")
-      .distinct()
-      .gte("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`)
-      .lt("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:59:59`);
-
-    if (error || !activeDevices || activeDevices.length === 0) {
-      console.log(`ℹ️ [HOURLY-SUMMARY] No hay dispositivos con actividad en la hora anterior`);
-      return;
-    }
-
-    console.log(`📊 [HOURLY-SUMMARY] ${activeDevices.length} dispositivos con actividad en hora ${hour}:00`);
-
-    let processed = 0;
-    let errors = 0;
-
-    // 🔥 2. Procesar CADA DISPOSITIVO con sus lecturas raw reales
-    const promises = activeDevices.map(async (item) => {
-      try {
-        const esp32Id = item.device_id;
-        
-        // 🔥 3. Obtener ESTADÍSTICAS PRECISAS de las lecturas raw de esa hora
-        const { data: stats, error: statsError } = await supabase
-          .from("lecturas_raw")
-          .select(`
-            min(energy) as min_energy,
-            max(energy) as max_energy,
-            max(power) as max_power,
-            avg(power) as avg_power,
-            count(*) as total_readings,
-            min(timestamp) as first_reading,
-            max(timestamp) as last_reading
-          `)
-          .eq("device_id", esp32Id)
-          .gte("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`)
-          .lt("timestamp", `${dateStr}T${hour.toString().padStart(2, '0')}:59:59`)
-          .single();
-
-        if (statsError || !stats || stats.total_readings < 2) {
-          console.warn(`⚠️ [HOURLY-SUMMARY] ${esp32Id}: Sin datos suficientes (${stats?.total_readings || 0} lecturas)`);
-          return null;
-        }
-
-        // 🔥 4. CÁLCULO PRECISO basado en lecturas raw (no aproximaciones)
-        const consumoKwh = (parseFloat(stats.max_energy) - parseFloat(stats.min_energy));
-        const potenciaPico = parseInt(stats.max_power) || 0;
-        const potenciaPromedio = parseFloat(stats.avg_power) || 0;
-        
-        // 🔥 Cálculo REAL de horas de uso (no estimado)
-        const timeDiffMs = new Date(stats.last_reading) - new Date(stats.first_reading);
-        const timeDiffHours = timeDiffMs / (1000 * 60 * 60); // Convertir a horas
-        const horasUso = timeDiffHours > 0 ? timeDiffHours : 0.1; // Mínimo 0.1 horas si el tiempo es muy corto
-        
-        // 🔥 Costo basado en tarifa REAL
-        const tarifaPorKwh = 0.50; // S/ por kWh
-        const costoEstimado = consumoKwh * tarifaPorKwh;
-        
-        // 🔥 5. Categoría de eficiencia basada en datos REALES
-        let categoria = 'B';
-        if (potenciaPromedio >= 100) categoria = 'A';
-        else if (potenciaPromedio >= 50) categoria = 'M';
-        else if (potenciaPromedio < 10) categoria = 'C';
-
-        // 🔥 6. Insertar/Actualizar en historicos_compactos
-        const fechaHoraInicio = `${dateStr}T${hour.toString().padStart(2, '0')}:00:00`;
-        
-        const { error: upsertError } = await supabase
-          .from("historicos_compactos")
-          .upsert({
-            device_id: esp32Id,
-            tipo_periodo: 'H', // Hora
-            fecha_inicio: fechaHoraInicio,
-            consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)), // 6 decimales de precisión
-            potencia_pico_w: Math.round(potenciaPico),
-            potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
-            horas_uso_estimadas: parseFloat(horasUso.toFixed(2)),
-            costo_estimado: parseFloat(costoEstimado.toFixed(4)), // 4 decimales para costo
-            dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
-            eficiencia_categoria: categoria,
-            timestamp_creacion: new Date().toISOString()
-          }, {
-            onConflict: 'device_id,tipo_periodo,fecha_inicio'
-          });
-
-        if (upsertError) {
-          console.error(`❌ [HOURLY-SUMMARY] ${esp32Id}:`, upsertError.message);
-          errors++;
-          return null;
-        }
-
-        processed++;
-        
-        // 🔥 7. Actualizar dispositivo con datos de la última hora
-        await supabase
-          .from("devices")
-          .update({ 
-            last_hour_consumption: consumoKwh,
-            last_hour_power: potenciaPromedio,
-            updated_at: new Date().toISOString()
-          })
-          .eq("esp32_id", esp32Id);
-
-        console.log(`✅ [HOURLY-SUMMARY] ${esp32Id}: ${consumoKwh.toFixed(6)} kWh, ${potenciaPromedio.toFixed(1)} W avg`);
-
-        return { 
-          device: esp32Id, 
-          consumo: consumoKwh,
-          lecturas: stats.total_readings,
-          tiempo_horas: horasUso
-        };
-
-      } catch (deviceError) {
-        console.error(`💥 [HOURLY-SUMMARY] Error en ${item.device_id}:`, deviceError.message);
-        errors++;
-        return null;
-      }
-    });
-
-    // Esperar todas las promesas
-    const results = await Promise.all(promises);
-    const successful = results.filter(r => r !== null);
-
-    console.log(`✅ [HOURLY-SUMMARY] COMPLETADO: ${processed} exitos, ${errors} errores`);
-    
-    // 🔥 8. Guardar estadísticas del resumen por hora
-    if (successful.length > 0) {
-      const totalLecturas = successful.reduce((sum, item) => sum + (item.lecturas || 0), 0);
-      const totalConsumo = successful.reduce((sum, item) => sum + (item.consumo || 0), 0);
-      
-      console.log(`📈 [HOURLY-SUMMARY] Estadísticas:`);
-      console.log(`   Total dispositivos: ${successful.length}`);
-      console.log(`   Total lecturas raw: ${totalLecturas}`);
-      console.log(`   Total consumo: ${totalConsumo.toFixed(6)} kWh`);
-      console.log(`   Hora procesada: ${hour}:00 (${dateStr})`);
-    }
-
-  } catch (e) {
-    console.error(`💥 [HOURLY-SUMMARY] Error general:`, e.message);
-    console.error(e.stack);
-  }
-}
-
 
 
 // 🔥 ENDPOINT: Pronóstico de precio usando TODAS las lecturas raw
@@ -3162,88 +2908,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// 📍 ENDPOINT: Análisis por horas (usa datos reales de lecturas_raw)
-app.get("/api/hourly-analysis/:deviceId", async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const { date } = req.query;
-    
-    if (!deviceId) {
-      return res.status(400).json({ 
-        success: false, 
-        error: "Falta deviceId" 
-      });
-    }
-
-    const targetDate = date || new Date().toISOString().split('T')[0];
-    
-    console.log(`⏰ [HOURLY-ANALYSIS] Obteniendo datos por hora para ${deviceId} en ${targetDate}`);
-    
-    // 🔥 CONSULTA REAL: Agrupa lecturas_raw por hora
-    const { data: hourlyData, error } = await supabase
-      .from("lecturas_raw")
-      .select(`
-        EXTRACT(HOUR FROM timestamp) as hour,
-        AVG(power) as avg_power,
-        MAX(power) as max_power,
-        COUNT(*) as readings_count
-      `)
-      .eq("device_id", deviceId)
-      .gte("timestamp", `${targetDate}T00:00:00`)
-      .lt("timestamp", `${targetDate}T23:59:59`)
-      .group("hour")
-      .order("hour", { ascending: true });
-
-    if (error) {
-      console.error("❌ Error en consulta por hora:", error.message);
-      return res.status(500).json({ 
-        success: false, 
-        error: "Error en la base de datos" 
-      });
-    }
-
-    // Formatear respuesta (24 horas completas)
-    const fullDay = Array.from({ length: 24 }, (_, hour) => {
-      const hourData = hourlyData?.find(h => parseInt(h.hour) === hour);
-      return {
-        hour: hour,
-        avg_power: hourData ? parseFloat(hourData.avg_power).toFixed(1) : 0,
-        max_power: hourData ? parseInt(hourData.max_power) : 0,
-        readings: hourData ? parseInt(hourData.readings_count) : 0,
-        label: `${hour}:00`,
-        isPeak: hour >= 18 && hour <= 22, // Determina basado en hora
-      };
-    });
-
-    // 🔥 Calcular horas pico reales (top 25% de potencia)
-    const powers = fullDay.map(h => parseFloat(h.avg_power)).filter(p => p > 0);
-    const avgPower = powers.length > 0 ? 
-      powers.reduce((a, b) => a + b) / powers.length : 0;
-    
-    const peakThreshold = avgPower * 1.5;
-    const peakHours = fullDay
-      .filter(h => parseFloat(h.avg_power) > peakThreshold)
-      .map(h => h.hour);
-
-    res.json({
-      success: true,
-      deviceId: deviceId,
-      date: targetDate,
-      hourlyData: fullDay,
-      peakHours: peakHours,
-      offPeakHours: [1, 2, 3, 4, 5], // Horas de menor actividad típica
-      avgPeakConsumption: avgPower,
-      message: `Análisis por hora completado: ${hourlyData?.length || 0} horas con datos`
-    });
-
-  } catch (e) {
-    console.error("💥 /api/hourly-analysis/:deviceId", e.message);
-    res.status(500).json({ 
-      success: false, 
-      error: e.message 
-    });
-  }
-});
 
 // 📍 ENDPOINT: Datos para gráfico tiempo real (últimas X horas)
 app.get("/api/realtime-chart/:deviceId", async (req, res) => {
