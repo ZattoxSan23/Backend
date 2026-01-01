@@ -3437,6 +3437,198 @@ app.get("/api/realtime-cost-forecast/:deviceId", async (req, res) => {
   }
 });
 
+// 📍 ENDPOINT: Análisis histórico con generación retroactiva
+app.get("/api/historical-analysis/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { days = 30 } = req.query;
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        error: "Falta deviceId"
+      });
+    }
+    console.log(`📊 [HISTORICAL-ANALYSIS] Solicitado para ${deviceId}, últimos ${days} días`);
+    // Primero, obtener históricos existentes
+    const { data: historicos, error } = await supabase
+      .from("historicos_compactos")
+      .select("*")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", 'D')
+      .order("fecha_inicio", { ascending: false })
+      .limit(parseInt(days));
+    if (error) {
+      console.error("❌ Error obteniendo históricos:", error.message);
+    }
+    let historicosData = historicos || [];
+    // Si hay menos de los solicitados, generar retroactivamente
+    if (historicosData.length < parseInt(days)) {
+      console.log(`🔄 [HISTORICAL-ANALYSIS] Generando retroactivamente ${parseInt(days) - historicosData.length} días`);
+      const today = new Date();
+      for (let i = 0; i < parseInt(days); i++) {
+        const date = new Date(today);
+        date.setDate(date.getDate() - i);
+        const dateStr = date.toISOString().split('T')[0];
+        // Verificar si ya existe
+        const existing = historicosData.find(h => h.fecha_inicio === dateStr);
+        if (!existing) {
+          // Obtener raw para ese día
+          const { data: dayRaw, error: rawError } = await supabase
+            .from("lecturas_raw")
+            .select(`
+              min(energy) as min_energy,
+              max(energy) as max_energy,
+              max(power) as max_power,
+              avg(power) as avg_power,
+              count(*) as total_readings,
+              min(timestamp) as first_reading,
+              max(timestamp) as last_reading
+            `)
+            .eq("device_id", deviceId)
+            .gte("timestamp", `${dateStr}T00:00:00`)
+            .lt("timestamp", `${dateStr}T23:59:59`)
+            .single();
+          let consumoKwh = 0;
+          let potenciaPico = 0;
+          let potenciaPromedio = 0;
+          let horasUso = 0;
+          let totalReadings = 0;
+          let hasData = false;
+          let energyStart = 0;
+          let energyEnd = 0;
+          let firstTime = null;
+          let lastTime = null;
+          if (!rawError && dayRaw && dayRaw.total_readings > 0) {
+            energyStart = parseFloat(dayRaw.min_energy || 0);
+            energyEnd = parseFloat(dayRaw.max_energy || 0);
+            consumoKwh = energyEnd - energyStart;
+            potenciaPico = parseFloat(dayRaw.max_power || 0);
+            potenciaPromedio = parseFloat(dayRaw.avg_power || 0);
+            totalReadings = parseInt(dayRaw.total_readings || 0);
+            hasData = true;
+            firstTime = dayRaw.first_reading;
+            lastTime = dayRaw.last_reading;
+            if (firstTime && lastTime && totalReadings >= 2) {
+              const timeDiffMs = new Date(lastTime) - new Date(firstTime);
+              horasUso = timeDiffMs / (1000 * 60 * 60);
+            }
+          }
+          const costoEstimado = consumoKwh * 0.50;
+          let categoria = 'B';
+          if (hasData) {
+            if (potenciaPromedio >= 100) categoria = 'A';
+            else if (potenciaPromedio >= 50) categoria = 'M';
+            else if (potenciaPromedio < 10) categoria = 'C';
+          } else {
+            categoria = 'N';
+          }
+          // Upsert en DB
+          const { error: upsertError } = await supabase
+            .from("historicos_compactos")
+            .upsert({
+              device_id: deviceId,
+              tipo_periodo: 'D',
+              fecha_inicio: dateStr,
+              consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)),
+              potencia_pico_w: Math.round(potenciaPico),
+              potencia_promedio_w: parseFloat(potenciaPromedio.toFixed(2)),
+              horas_uso_estimadas: parseFloat(horasUso.toFixed(2)),
+              costo_estimado: parseFloat(costoEstimado.toFixed(4)),
+              dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
+              eficiencia_categoria: categoria,
+              timestamp_creacion: new Date().toISOString(),
+              has_data: hasData,
+              raw_readings_count: totalReadings,
+              auto_generated: true,
+              retroactively_generated: true,
+              energy_start: energyStart,
+              energy_end: energyEnd,
+              first_reading_time: firstTime,
+              last_reading_time: lastTime
+            }, {
+              onConflict: 'device_id,tipo_periodo,fecha_inicio'
+            });
+          if (upsertError) {
+            console.error(`❌ Error creando histórico para ${dateStr}:`, upsertError.message);
+          } else {
+            console.error(`✅ Creado histórico para ${dateStr}: ${hasData ? 'con datos' : 'vacío'}`);
+            // Agregar a la lista
+            historicosData.push({
+              fecha_inicio: dateStr,
+              consumo_total_kwh: consumoKwh,
+              potencia_pico_w: potenciaPico,
+              potencia_promedio_w: potenciaPromedio,
+              horas_uso_estimadas: horasUso,
+              costo_estimado: costoEstimado,
+              dias_alto_consumo: potenciaPico > 1000 ? 1 : 0,
+              eficiencia_categoria: categoria,
+              has_data: hasData,
+              raw_readings_count: totalReadings
+            });
+          }
+        }
+      }
+    }
+    // Ordenar por fecha ascendente para análisis
+    historicosData.sort((a, b) => new Date(a.fecha_inicio) - new Date(b.fecha_inicio));
+    // Resto del código para estadisticas y recomendacionSolar...
+    const estadisticas = {
+      totalDias: historicosData.length || 0,
+      consumoTotal: 0,
+      costoTotal: 0,
+      picoMaximo: 0,
+      diasAltoConsumo: 0,
+      promedioDiario: 0
+    };
+    if (historicosData.length > 0) {
+      historicosData.forEach(day => {
+        estadisticas.consumoTotal += day.consumo_total_kwh || 0;
+        estadisticas.costoTotal += day.costo_estimado || 0;
+        if (day.potencia_pico_w > estadisticas.picoMaximo) {
+          estadisticas.picoMaximo = day.potencia_pico_w;
+        }
+        if (day.dias_alto_consumo > 0) {
+          estadisticas.diasAltoConsumo++;
+        }
+      });
+      estadisticas.promedioDiario = estadisticas.consumoTotal / historicosData.length;
+    }
+    const recomendacionSolar = estadisticas.promedioDiario > 0 ? {
+      consumoMensual: estadisticas.promedioDiario * 30,
+      panelesRecomendados: Math.ceil((estadisticas.promedioDiario * 30 * 0.7) / (4.5 * 30 * 0.1)),
+      ahorroMensual: estadisticas.promedioDiario * 30 * 0.7 * 0.50,
+      periodoRetorno: 36
+    } : null;
+    res.json({
+      success: true,
+      deviceId: deviceId,
+      periodosAnalizados: days,
+      historicos: historicosData,
+      estadisticas: estadisticas,
+      recomendacionSolar: recomendacionSolar,
+      message: historicosData.length === 0
+        ? "No hay datos históricos para este dispositivo. Los datos se generarán automáticamente cada día a las 23:59."
+        : `Análisis de ${historicosData.length} días completado`
+    });
+  } catch (e) {
+    console.error("💥 /api/historical-analysis/:deviceId", e.message);
+    res.json({
+      success: true,
+      deviceId: req.params.deviceId,
+      historicos: [],
+      estadisticas: {
+        totalDias: 0,
+        consumoTotal: 0,
+        costoTotal: 0,
+        picoMaximo: 0,
+        diasAltoConsumo: 0,
+        promedioDiario: 0
+      },
+      message: "Generando datos históricos... Por favor, espera hasta mañana para ver análisis completos."
+    });
+  }
+});
+
 // 📍 ENDPOINT: Análisis comparativo REAL
 app.get("/api/comparative-analysis/:deviceId", async (req, res) => {
   try {
@@ -3622,6 +3814,7 @@ async function initializeDailyRecords() {
     console.error(`💥 [INIT] Error inicializando registros:`, e.message);
   }
 }
+
 
 // Iniciar la tarea periódica de limpieza de estado
 const CLEANUP_INTERVAL_MS = 2000;
