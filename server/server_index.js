@@ -2830,7 +2830,7 @@ function generateRecommendations(analysis) {
   return recommendations;
 }
 
-// 📍 ENDPOINT: Ejecutar cálculo preciso para un día específico
+// 📍 ENDPOINT: Ejecutar cálculo preciso para un día específico - VERSIÓN CORREGIDA
 app.post("/api/recalculate-day/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -2845,7 +2845,7 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
 
     console.log(`🔄 [RECALCULATE-DAY] Recalculando ${deviceId} - ${date}`);
 
-    // Obtener lecturas raw del día
+    // 🔥 OBTENER TODAS LAS LECTURAS RAW DEL DÍA
     const { data: readings, error } = await supabase
       .from("lecturas_raw")
       .select(`
@@ -2878,24 +2878,41 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
       });
     }
 
-    // Calcular valores precisos
-    const firstReading = readings[0];
-    const lastReading = readings[readings.length - 1];
-    const startEnergy = firstReading.energy;
-    const endEnergy = lastReading.energy;
-    const consumedKwh = Math.max(0, endEnergy - startEnergy);
+    // 🔥 ANÁLISIS DETALLADO DE TUS DATOS
+    console.log(`📊 [RECALCULATE-DAY] ${readings.length} lecturas encontradas`);
+    console.log(`📊 Primera lectura: ${readings[0].timestamp} - Energy: ${readings[0].energy}`);
+    console.log(`📊 Última lectura: ${readings[readings.length - 1].timestamp} - Energy: ${readings[readings.length - 1].energy}`);
+
+    // 🔥 ENCONTRAR MÍNIMO Y MÁXIMO REAL (no solo primera/última)
+    const energies = readings.map(r => parseFloat(r.energy || 0));
+    const minEnergy = Math.min(...energies);
+    const maxEnergy = Math.max(...energies);
     
-    const firstTime = new Date(firstReading.timestamp);
-    const lastTime = new Date(lastReading.timestamp);
-    const durationHours = (lastTime - firstTime) / (1000 * 60 * 60);
+    // Encontrar los registros correspondientes
+    const minReading = readings.find(r => parseFloat(r.energy) === minEnergy);
+    const maxReading = readings.find(r => parseFloat(r.energy) === maxEnergy);
+
+    // 🔥 CÁLCULOS PRECISOS
+    const consumoKwh = Math.max(0, maxEnergy - minEnergy);
     
-    const powers = readings.map(r => r.power);
+    const firstTime = new Date(minReading.timestamp);
+    const lastTime = new Date(maxReading.timestamp);
+    const durationMs = lastTime - firstTime;
+    const durationHours = durationMs / (1000 * 60 * 60);
+    
+    const powers = readings.map(r => r.power || 0);
     const avgPower = powers.reduce((a, b) => a + b, 0) / powers.length;
     const maxPower = Math.max(...powers);
     
-    const cost = consumedKwh * 0.50;
+    const cost = consumoKwh * 0.50;
 
-    // Buscar o crear registro en historicos_compactos
+    // 🔥 LOG DETALLADO
+    console.log(`📊 [CALCULOS] Mínimo: ${minEnergy} kWh en ${minReading.timestamp}`);
+    console.log(`📊 [CALCULOS] Máximo: ${maxEnergy} kWh en ${maxReading.timestamp}`);
+    console.log(`📊 [CALCULOS] Consumo: ${maxEnergy} - ${minEnergy} = ${consumoKwh} kWh`);
+    console.log(`📊 [CALCULOS] Duración: ${firstTime.toISOString()} → ${lastTime.toISOString()} = ${durationHours} horas`);
+
+    // 🔥 BUSCAR O CREAR REGISTRO
     const { data: existingRecord, error: findError } = await supabase
       .from("historicos_compactos")
       .select("id")
@@ -2905,55 +2922,62 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
       .single();
 
     let result;
+    let action = "";
+
     if (findError && findError.code === 'PGRST116') {
       // Crear nuevo registro
+      action = "CREADO";
       result = await supabase
         .from("historicos_compactos")
         .insert({
           device_id: deviceId,
           tipo_periodo: 'D',
           fecha_inicio: date,
-          consumo_total_kwh: parseFloat(consumedKwh.toFixed(6)),
+          consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)),
           potencia_pico_w: Math.round(maxPower),
           potencia_promedio_w: parseFloat(avgPower.toFixed(2)),
-          horas_uso_estimadas: parseFloat(durationHours.toFixed(4)),
-          costo_estimado: parseFloat(cost.toFixed(4)),
+          horas_uso_estimadas: parseFloat(durationHours.toFixed(6)),
+          costo_estimado: parseFloat(cost.toFixed(6)),
           dias_alto_consumo: maxPower > 1000 ? 1 : 0,
           eficiencia_categoria: avgPower >= 100 ? 'A' : (avgPower >= 50 ? 'M' : (avgPower >= 10 ? 'B' : 'C')),
           timestamp_creacion: new Date().toISOString(),
           has_data: true,
           raw_readings_count: readings.length,
           auto_generated: true,
-          first_reading_time: firstReading.timestamp,
-          last_reading_time: lastReading.timestamp,
-          energy_start: parseFloat(startEnergy.toFixed(6)),
-          energy_end: parseFloat(endEnergy.toFixed(6)),
+          retroactively_generated: true,
+          first_reading_time: minReading.timestamp,
+          last_reading_time: maxReading.timestamp,
+          energy_start: parseFloat(minEnergy.toFixed(6)),
+          energy_end: parseFloat(maxEnergy.toFixed(6)),
           data_precision: "high",
-          recalculated_at: new Date().toISOString()
+          recalculated_at: new Date().toISOString(),
+          notes: `Recalculado con ${readings.length} lecturas raw. Energía: ${minEnergy.toFixed(6)} → ${maxEnergy.toFixed(6)} kWh`
         })
         .select()
         .single();
     } else {
       // Actualizar registro existente
+      action = "ACTUALIZADO";
       result = await supabase
         .from("historicos_compactos")
         .update({
-          consumo_total_kwh: parseFloat(consumedKwh.toFixed(6)),
+          consumo_total_kwh: parseFloat(consumoKwh.toFixed(6)),
           potencia_pico_w: Math.round(maxPower),
           potencia_promedio_w: parseFloat(avgPower.toFixed(2)),
-          horas_uso_estimadas: parseFloat(durationHours.toFixed(4)),
-          costo_estimado: parseFloat(cost.toFixed(4)),
+          horas_uso_estimadas: parseFloat(durationHours.toFixed(6)),
+          costo_estimado: parseFloat(cost.toFixed(6)),
           dias_alto_consumo: maxPower > 1000 ? 1 : 0,
           eficiencia_categoria: avgPower >= 100 ? 'A' : (avgPower >= 50 ? 'M' : (avgPower >= 10 ? 'B' : 'C')),
           updated_at: new Date().toISOString(),
           has_data: true,
           raw_readings_count: readings.length,
-          first_reading_time: firstReading.timestamp,
-          last_reading_time: lastReading.timestamp,
-          energy_start: parseFloat(startEnergy.toFixed(6)),
-          energy_end: parseFloat(endEnergy.toFixed(6)),
+          first_reading_time: minReading.timestamp,
+          last_reading_time: maxReading.timestamp,
+          energy_start: parseFloat(minEnergy.toFixed(6)),
+          energy_end: parseFloat(maxEnergy.toFixed(6)),
           data_precision: "high",
-          recalculated_at: new Date().toISOString()
+          recalculated_at: new Date().toISOString(),
+          notes: `Recalculado con ${readings.length} lecturas raw. Energía: ${minEnergy.toFixed(6)} → ${maxEnergy.toFixed(6)} kWh`
         })
         .eq("id", existingRecord.id)
         .select()
@@ -2968,22 +2992,41 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
       });
     }
 
-    console.log(`✅ [RECALCULATE-DAY] ${deviceId} - ${date}: Recalculado con ${readings.length} lecturas`);
+    console.log(`✅ [RECALCULATE-DAY] ${deviceId} - ${date}: ${action} con ${readings.length} lecturas`);
 
+    // 🔥 RESPUESTA DETALLADA
     res.json({
       success: true,
-      message: "Día recalculado exitosamente",
+      message: `Día ${date} recalculado exitosamente`,
       deviceId: deviceId,
       date: date,
       readingsProcessed: readings.length,
+      dataSummary: {
+        firstReading: {
+          timestamp: minReading.timestamp,
+          energy: parseFloat(minEnergy.toFixed(6)),
+          power: minReading.power
+        },
+        lastReading: {
+          timestamp: maxReading.timestamp,
+          energy: parseFloat(maxEnergy.toFixed(6)),
+          power: maxReading.power
+        },
+        timeRange: {
+          start: minReading.timestamp,
+          end: maxReading.timestamp,
+          durationHours: parseFloat(durationHours.toFixed(6)),
+          durationHuman: `${Math.floor(durationHours)}h ${Math.round((durationHours % 1) * 60)}m`
+        }
+      },
       results: {
-        consumption: parseFloat(consumedKwh.toFixed(6)),
-        cost: parseFloat(cost.toFixed(4)),
-        durationHours: parseFloat(durationHours.toFixed(4)),
+        consumption: parseFloat(consumoKwh.toFixed(6)),
+        cost: parseFloat(cost.toFixed(6)),
+        durationHours: parseFloat(durationHours.toFixed(6)),
         avgPower: parseFloat(avgPower.toFixed(2)),
         maxPower: maxPower,
-        startEnergy: parseFloat(startEnergy.toFixed(6)),
-        endEnergy: parseFloat(endEnergy.toFixed(6))
+        startEnergy: parseFloat(minEnergy.toFixed(6)),
+        endEnergy: parseFloat(maxEnergy.toFixed(6))
       },
       record: result.data,
       timestamp: new Date().toISOString()
@@ -2997,6 +3040,7 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
     });
   }
 });
+
 
 // 📍 ENDPOINT: Recalcular múltiples días automáticamente
 app.post("/api/recalculate-period/:deviceId", async (req, res) => {
