@@ -663,17 +663,6 @@ async function cleanupOldRawData() {
       console.log(`✅ [CLEANUP-AUTO] Limpieza completada. Eliminadas lecturas anteriores a ${cutoffDateStr}`);
     }
     
-    // 🔥 También eliminar registros históricos de días anteriores (opcional)
-    const { error: deleteHistError } = await supabase
-      .from("historicos_compactos")
-      .delete()
-      .lt("fecha_inicio", cutoffDateStr)
-      .eq("tipo_periodo", 'D');
-    
-    if (!deleteHistError) {
-      console.log(`🧹 [CLEANUP-AUTO] También eliminados historicos_compactos antiguos`);
-    }
-    
     cleanupExecuted = true;
     
   } catch (e) {
