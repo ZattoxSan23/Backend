@@ -4255,7 +4255,7 @@ app.listen(PORT, "0.0.0.0", async () => {
   console.log(`   💾 Guarda 1 de cada ${DATA_CONFIG.saveEveryNReadings} lecturas (cada ~${DATA_CONFIG.saveEveryNReadings * 5}s)`);
   console.log(`   📅 Mantiene ${DATA_CONFIG.keepRawDataDays} día(s) de lecturas raw`);
   console.log(`📈 Endpoints de análisis:`);
-  console.log(`   GET  /api/historical-analysis/:deviceId`);
+  console.log(`GET /api/daily-analysis-detailed/88:57:21:47:AD:24?date=2026-01-03&includeRawData=true   `);
   console.log(`   GET  /api/solar-recommendation/:deviceId`);
   console.log(`   POST /api/force-cleanup (limpieza manual)`);
   console.log(`⏰ Cleanup interval: ${CLEANUP_INTERVAL_MS}ms`);
