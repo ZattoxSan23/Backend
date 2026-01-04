@@ -232,14 +232,14 @@ async function createDeviceInSupabase(deviceData) {
     return null;
   }
 }
-const getPeruTimestamp = () => {
-  const now = new Date();
-  const offset = -5 * 60; // UTC-5 para Perú (sin DST)
-  const local = new Date(now.getTime() + offset * 60 * 1000);
-  return local.toISOString().replace('Z', '-05:00');
+const getPeruTimestamp = (input = new Date()) => {
+  const date = input instanceof Date ? input : new Date(input);
+  // Ajuste manual para UTC-5 (Perú sin DST)
+  const offsetMs = -5 * 60 * 60 * 1000; // -5 horas en ms
+  const localDate = new Date(date.getTime() + offsetMs);
+  // Formatear como ISO con offset fijo -05:00
+  return localDate.toISOString().slice(0, -1) + '-05:00';
 };
-
-
 
 // 🔥 NUEVA FUNCIÓN: Obtener estadísticas actuales del día
 async function getCurrentDayStats(deviceId) {
@@ -482,7 +482,7 @@ async function updateDailyStatsInRealTime(deviceId, data) {
     console.error(`💥 [DAY-STATS] ${deviceId}: Error actualizando estadísticas:`, e.message);
     return false;
   }
-}
+};
 async function updateDeviceInSupabase(deviceId, updates) {
   try {
     const { data, error } = await supabase
