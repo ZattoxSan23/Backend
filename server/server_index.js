@@ -301,10 +301,15 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
   try {
     const now = new Date(currentTimestamp);
     const todayStr = now.toISOString().split('T')[0];
+    // 🔥 CORRECCIÓN: No crear si fecha futura
+    if (todayStr > new Date().toISOString().split('T')[0]) {
+      console.warn(`⚠️ [NUEVO-DIA] ${deviceId}: Fecha futura (${todayStr}), ignorando creación`);
+      return;
+    }
     // 🔥 Verificar si YA existe un registro para hoy
     const { data: existingToday, error: checkError } = await supabase
       .from("historicos_compactos")
-      .select("id, fecha_inicio, has_data, raw_readings_count, first_reading_time")  // 🔥 CORRECCIÓN: Incluir first_reading_time
+      .select("id, fecha_inicio, has_data, raw_readings_count, first_reading_time") // 🔥 CORRECCIÓN: Incluir first_reading_time
       .eq("device_id", deviceId)
       .eq("tipo_periodo", 'D')
       .eq("fecha_inicio", todayStr)
@@ -331,7 +336,7 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
           raw_readings_count: 0,
           auto_generated: true,
           is_today: true,
-          first_reading_time: new Date().toISOString()  // 🔥 CORRECCIÓN: Setear inicial a ahora
+          first_reading_time: new Date().toISOString() // 🔥 CORRECCIÓN: Setear inicial a ahora
         });
     }
     // 🔥 Si ya existe registro pero no tiene datos (primera lectura con datos)
@@ -344,7 +349,7 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
         // Buscar la primera lectura del día para obtener energía inicial
         const { data: firstReading } = await supabase
           .from("lecturas_raw")
-          .select("energy, timestamp")  // 🔥 CORRECCIÓN: Incluir timestamp para hours
+          .select("energy, timestamp") // 🔥 CORRECCIÓN: Incluir timestamp para hours
           .eq("device_id", deviceId)
           .gte("timestamp", `${todayStr}T00:00:00`)
           .order("timestamp", { ascending: true })
@@ -368,7 +373,7 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
             raw_readings_count: 1,
             updated_at: new Date().toISOString(),
             energy_start: energyStart,
-            first_reading_time: firstTime  // 🔥 CORRECCIÓN: Setear correctamente
+            first_reading_time: firstTime // 🔥 CORRECCIÓN: Setear correctamente
           })
           .eq("id", existingToday.id);
       }
@@ -401,23 +406,23 @@ async function updateDailyStatsInRealTime(deviceId, data) {
       .eq("tipo_periodo", 'D')
       .eq("fecha_inicio", serverTodayStr)
       .single();
-  
+ 
     let isNewRecord = false;
-  
+ 
     // Si no existe, crear registro inicial
     if (error || !dayRecord) {
       console.log(`📝 [DAY-STATS] ${deviceId}: Creando nuevo registro para hoy (${serverTodayStr})`);
-    
+   
       // Obtener energía inicial del día
       const { data: deviceData } = await supabase
         .from("devices")
         .select("energy")
         .eq("esp32_id", deviceId)
         .single();
-    
+   
       const initialEnergy = deviceData?.energy || energy;
       const energyDelta = Math.max(0, energy - initialEnergy);
-    
+   
       await supabase
         .from("historicos_compactos")
         .insert({
@@ -440,31 +445,31 @@ async function updateDailyStatsInRealTime(deviceId, data) {
           // 🔥 CORRECCIÓN: Setear first_reading_time al crear si es primera lectura
           first_reading_time: new Date(timestamp).toISOString()
         });
-    
+   
       isNewRecord = true;
     } else {
       // Si ya existe, actualizar estadísticas
       const readingsCount = (dayRecord.raw_readings_count || 0) + 1;
       const newPeakPower = Math.max(dayRecord.potencia_pico_w || 0, power);
-    
+   
       // Calcular nuevo promedio
       const currentAvg = dayRecord.potencia_promedio_w || 0;
       const newAvg = ((currentAvg * (readingsCount - 1)) + power) / readingsCount;
-    
+   
       // 🔥 CORRECCIÓN: Obtener energyStart y lastEnergy para detectar reset
       const energyStart = dayRecord.energy_start || 0;
       const lastEnergy = dayRecord.energy_end || energyStart; // Último energy conocido
-      
+     
       let currentConsumption = energy - energyStart;
       let resetDetected = false;
-      
+     
       if (energy < lastEnergy) {
         // 🔥 CORRECCIÓN: Detectar reset y ajustar consumo sin perder el anterior
         console.warn(`🚨 [RESET-DETECTED] ${deviceId}: Energy reset detectado (${energy} < ${lastEnergy})`);
         resetDetected = true;
         currentConsumption = dayRecord.consumo_total_kwh + energy; // Agregar consumo previo + nuevo desde 0
       } // Else: normal, currentConsumption = energy - energyStart (ya calculado)
-    
+   
       // 🔥 CORRECCIÓN: Mejorar cálculo de horas de uso (usar timestamps reales)
       let firstTime = dayRecord.first_reading_time ? new Date(dayRecord.first_reading_time) : new Date(timestamp);
       if (!dayRecord.first_reading_time) {
@@ -472,8 +477,8 @@ async function updateDailyStatsInRealTime(deviceId, data) {
         firstTime = new Date(timestamp);
       }
       const timeDiffMs = new Date(timestamp) - firstTime;
-      const hoursUsed = timeDiffMs / (1000 * 60 * 60); // ms a horas
-    
+      const hoursUsed = Math.max(0, timeDiffMs / (1000 * 60 * 60)); // 🔥 CORRECCIÓN: Evitar negativos con Math.max
+   
       // 🔥 CORRECCIÓN: Actualizar con reset_detected si aplica y first si necesario
       const updates = {
         consumo_total_kwh: parseFloat(currentConsumption.toFixed(6)),
@@ -498,7 +503,7 @@ async function updateDailyStatsInRealTime(deviceId, data) {
         .from("historicos_compactos")
         .update(updates)
         .eq("id", dayRecord.id);
-    
+   
       console.log(`📊 [DAY-STATS] ${deviceId}: Actualizado registro del día (lectura #${readingsCount})${resetDetected ? ' - RESET MANEJADO' : ''}`);
     }
     return isNewRecord;
@@ -788,7 +793,7 @@ async function generateDailySummaryOptimized() {
           // 🔥 CORRECCIÓN: Cálculo de horas de uso basado en timestamps
           if (stats.first_reading && stats.last_reading && totalReadings >= 2) {
             const timeDiffMs = new Date(stats.last_reading) - new Date(stats.first_reading);
-            horasUso = timeDiffMs / (1000 * 60 * 60);
+            horasUso = Math.max(0, timeDiffMs / (1000 * 60 * 60)); // 🔥 CORRECCIÓN: Evitar negativos
           } else {
             horasUso = 0.1; // Mínimo si pocas lecturas
           }
@@ -1311,12 +1316,19 @@ app.post("/api/data", async (req, res) => {
         powerFactor: data.powerFactor,
       },
     };
-    // 🔥 ACTUALIZAR ESTADÍSTICAS DEL DÍA EN TIEMPO REAL (con finalEnergy)
-    await updateDailyStatsInRealTime(deviceId, {
-      power: data.power,
-      energy: finalEnergy,
-      timestamp: now
-    });
+    // 🔥 CORRECCIÓN: Ignorar si timestamp futuro
+    const readingDate = new Date(now).toISOString().split('T')[0];
+    const serverToday = new Date().toISOString().split('T')[0];
+    if (readingDate > serverToday) {
+      console.warn(`⚠️ [DATA] ${deviceId}: Timestamp futuro, ignorando stats`);
+    } else {
+      // 🔥 ACTUALIZAR ESTADÍSTICAS DEL DÍA EN TIEMPO REAL (con finalEnergy)
+      await updateDailyStatsInRealTime(deviceId, {
+        power: data.power,
+        energy: finalEnergy,
+        timestamp: now
+      });
+    }
     // 🔥 DETECTAR SI CAMBIÓ EL DÍA (00:00 - 00:05) HORA PERÚ
     const currentHour = nowDate.getHours();
     const currentMinute = nowDate.getMinutes();
@@ -4267,23 +4279,18 @@ async function initializeDailyRecords() {
   try {
     const todayStr = new Date().toISOString().split('T')[0];
     console.log(`📝 [INIT] Verificando registros para hoy: ${todayStr}`);
-
     // Obtener todos los dispositivos registrados
     const { data: devices, error } = await supabase
       .from("devices")
       .select("esp32_id")
       .not("esp32_id", "is", null);
-
     if (error || !devices || devices.length === 0) {
       console.log(`ℹ️ [INIT] No hay dispositivos registrados`);
       return;
     }
-
     console.log(`📝 [INIT] Verificando ${devices.length} dispositivos`);
-
     for (const device of devices) {
       const esp32Id = device.esp32_id;
-
       // Verificar si ya existe registro para hoy
       const { data: existing, error: checkError } = await supabase
         .from("historicos_compactos")
@@ -4292,11 +4299,14 @@ async function initializeDailyRecords() {
         .eq("tipo_periodo", 'D')
         .eq("fecha_inicio", todayStr)
         .single();
-
       // Si no existe, crear registro vacío
       if (checkError && checkError.code === 'PGRST116') {
+        // 🔥 CORRECCIÓN: Confirmar que todayStr no es futuro (aunque debería no ser)
+        if (todayStr > new Date().toISOString().split('T')[0]) {
+          console.warn(`⚠️ [INIT] Fecha futura (${todayStr}), ignorando creación para ${esp32Id}`);
+          continue;
+        }
         console.log(`📝 [INIT] Creando registro vacío para ${esp32Id} - ${todayStr}`);
-
         await supabase
           .from("historicos_compactos")
           .insert({
@@ -4320,13 +4330,11 @@ async function initializeDailyRecords() {
           });
       }
     }
-
     console.log(`✅ [INIT] Registros diarios inicializados para ${devices.length} dispositivos`);
   } catch (e) {
     console.error(`💥 [INIT] Error inicializando registros:`, e.message);
   }
 }
-
 
 // Iniciar la tarea periódica de limpieza de estado
 const CLEANUP_INTERVAL_MS = 2000;
