@@ -1242,19 +1242,25 @@ app.post("/api/data", async (req, res) => {
       energy,
       frequency,
       powerFactor,
-      timestamp: clientTimestamp  // ← Aceptamos timestamp del ESP32 si viene
+      timestamp: clientTimestamp // ← Aceptamos timestamp del ESP32 si viene
     } = req.body;
-
     if (!deviceId) return res.status(400).json({ error: "Falta deviceId." });
 
-    // Siempre usamos la hora del servidor en zona Perú
+    // 🔥 CORRECCIÓN: Usar clientTimestamp si viene (asumido como UTC), ajustado a Perú
     const serverNow = Date.now();
-    const peruNow = getPeruTimestamp();
-
-    // Si el ESP32 envía timestamp, lo logueamos pero NO lo usamos para guardar
-    // (evitamos problemas de desfase horario del dispositivo)
+    let currentTime = serverNow;
+    let peruTimestamp = getPeruTimestamp();
+    let timestampSource = 'server';
     if (clientTimestamp) {
       console.log(`[DATA] ${deviceId} - Timestamp recibido del ESP32: ${clientTimestamp}`);
+      const clientDate = new Date(clientTimestamp); // Parsear como UTC
+      if (!isNaN(clientDate.getTime())) {
+        currentTime = clientDate.getTime();
+        peruTimestamp = getPeruTimestamp(clientDate);
+        timestampSource = 'client-adjusted';
+      } else {
+        console.warn(`⚠️ [DATA] ${deviceId} - Timestamp inválido del cliente: ${clientTimestamp}`);
+      }
     }
 
     const data = {
@@ -1264,26 +1270,25 @@ app.post("/api/data", async (req, res) => {
       energy: +energy || 0,
       frequency: +frequency || 0,
       powerFactor: +powerFactor || 0,
-      timestamp: serverNow,  // Usamos hora del servidor
+      timestamp: currentTime, // Usamos el timestamp ajustado para cálculos
     };
 
     const deviceInDb = await findDeviceByEsp32Id(deviceId);
     const isRegistered = !!deviceInDb;
     const userId = deviceInDb?.user_id;
     const deviceDbId = deviceInDb?.id;
-
     const deviceState = initializeDeviceState(deviceId, deviceInDb, wifiSsid);
 
     const finalEnergy = calculateEnergyAccumulated(
       deviceState,
       data.power,
-      serverNow
+      currentTime // 🔥 Usar currentTime ajustado
     );
 
     onlineDevices[deviceId] = {
       ...deviceState,
-      lastSeen: serverNow,
-      lastTs: serverNow,
+      lastSeen: currentTime, // 🔥 Actualizar con tiempo ajustado
+      lastTs: currentTime,
       lastPower: data.power,
       energy: finalEnergy,
       userId,
@@ -1301,19 +1306,18 @@ app.post("/api/data", async (req, res) => {
     await updateDailyStatsInRealTime(deviceId, {
       power: data.power,
       energy: finalEnergy,
-      timestamp: serverNow
+      timestamp: currentTime // 🔥 Usar tiempo ajustado
     });
 
-    const nowDate = new Date(serverNow);
+    const nowDate = new Date(currentTime);
     const currentHour = nowDate.getHours();
     const currentMinute = nowDate.getMinutes();
-
     if (currentHour === 0 && currentMinute <= 5) {
       if (!deviceState.lastDayChange ||
           new Date(deviceState.lastDayChange).getDate() !== nowDate.getDate()) {
         console.log(`🔄 [DIA-DETECTADO] ${deviceId}: Procesando cambio de día...`);
-        await checkAndGenerateDailySummaryOptimized(deviceId, serverNow);
-        onlineDevices[deviceId].lastDayChange = serverNow;
+        await checkAndGenerateDailySummaryOptimized(deviceId, currentTime);
+        onlineDevices[deviceId].lastDayChange = currentTime;
       }
     }
 
@@ -1322,7 +1326,7 @@ app.post("/api/data", async (req, res) => {
     if (isRegistered && deviceDbId) {
       const updates = {
         is_online: true,
-        last_seen: peruNow,                // ← Hora peruana
+        last_seen: peruTimestamp, // ← Hora peruana ajustada
         power: data.power,
         energy: finalEnergy,
         voltage: data.voltage,
@@ -1343,7 +1347,8 @@ app.post("/api/data", async (req, res) => {
       `WiFi: "${wifiSsid || 'No SSID'}" | ` +
       `V:${data.voltage.toFixed(1)}V I:${data.current.toFixed(3)}A ` +
       `P:${data.power.toFixed(1)}W E:${finalEnergy.toFixed(6)}kWh ` +
-      `| ${isRegistered ? "✅ REGISTRADO" : "⚠️ NO REGISTRADO"}`
+      `| ${isRegistered ? "✅ REGISTRADO" : "⚠️ NO REGISTRADO"} ` +
+      `| TS: ${timestampSource}`
     );
 
     res.json({
@@ -1351,7 +1356,7 @@ app.post("/api/data", async (req, res) => {
       registered: isRegistered,
       calculatedEnergy: finalEnergy,
       wifiSsid: wifiSsid,
-      timestamp: peruNow  // ← Devolvemos hora peruana al cliente
+      timestamp: peruTimestamp // ← Devolvemos hora peruana ajustada al cliente
     });
   } catch (e) {
     console.error("💥 /api/data", e.message);
