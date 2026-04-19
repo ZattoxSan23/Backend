@@ -308,7 +308,7 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
   try {
     const now = new Date(currentTimestamp);
     const todayStr = getPeruDateStr(now); // CORRECCIÓN: Usar getPeruDateStr
-    
+
     // 🔥 Verificar si YA existe un registro para hoy
     const { data: existingToday, error: checkError } = await supabase
       .from("historicos_compactos")
@@ -321,7 +321,7 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
     // Si es la PRIMERA lectura del día y no existe registro
     if (!existingToday || checkError?.code === 'PGRST116') {
       console.log(`📝 [PRIMERA-LECTURA] ${deviceId}: Primera lectura del día ${todayStr}`);
-      
+
       // Crear registro inicial vacío
       await supabase
         .from("historicos_compactos")
@@ -347,12 +347,12 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
     // 🔥 Si ya existe registro pero no tiene datos (primera lectura con datos)
     else if (existingToday && !existingToday.has_data) {
       console.log(`🔄 [PRIMEROS-DATOS] ${deviceId}: Actualizando primer registro con datos`);
-      
+
       // Obtener el estado actual del dispositivo
       const deviceState = onlineDevices[deviceId];
       if (deviceState) {
         const currentEnergy = deviceState.energy || 0;
-        
+
         // Buscar la primera lectura del día para obtener energía inicial
         const { data: firstReading } = await supabase
           .from("lecturas_raw")
@@ -365,10 +365,10 @@ async function checkAndGenerateDailySummaryOptimized(deviceId, currentTimestamp)
 
         const energyStart = firstReading?.energy || currentEnergy;
         const consumoInicial = Math.max(0, currentEnergy - energyStart);
-        
+
         // 🔥 CORRECCIÓN: Calcular horas inicial (si >1 lectura, pero aquí es primera, set 0.1)
         const firstTime = firstReading?.timestamp || getPeruTimestamp();
-        
+
         await supabase
           .from("historicos_compactos")
           .update({
@@ -564,7 +564,7 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
     const todayStr = new Date().toISOString().split('T')[0];
-  
+
     const { data: dayStats, error } = await supabase
       .from("historicos_compactos")
       .select("*")
@@ -572,7 +572,7 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
       .eq("tipo_periodo", 'D')
       .eq("fecha_inicio", todayStr)
       .single();
-  
+
     if (error) {
       return res.json({
         success: true,
@@ -582,11 +582,11 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
         today: todayStr
       });
     }
-  
+
     // Calcular estadísticas adicionales
     const horasTranscurridas = new Date().getHours() + (new Date().getMinutes() / 60);
     const proyeccionDiaria = dayStats.consumo_total_kwh * (24 / horasTranscurridas);
-   
+
     // 🔥 CORRECCIÓN: Agregar comparación con ayer para concienciar
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
@@ -598,7 +598,7 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
       .eq("tipo_periodo", 'D')
       .eq("fecha_inicio", yesterdayStr)
       .single();
-   
+
     let comparison = {
       consumoChange: 'N/A',
       costoChange: 'N/A',
@@ -616,7 +616,7 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
         message: consumoChange > 0 ? `Consumo ${consumoChange}% mayor que ayer - considera revisar uso` : `Consumo ${Math.abs(consumoChange)}% menor que ayer - buen ahorro!`
       };
     }
-  
+
     res.json({
       success: true,
       has_data: true,
@@ -641,7 +641,7 @@ app.get("/api/today-stats/:deviceId", async (req, res) => {
       last_updated: dayStats.updated_at || dayStats.timestamp_creacion,
       timestamp: getPeruTimestamp() // 🔥 Hora peruana
     });
-  
+
   } catch (e) {
     console.error("💥 /api/today-stats/:deviceId", e.message);
     res.status(500).json({
@@ -655,28 +655,28 @@ async function cleanupOldRawData() {
   try {
     const now = new Date();
     console.log(`🧹 [CLEANUP-AUTO] Iniciando limpieza automática a las ${now.toLocaleTimeString()}`);
-    
+
     // Calcular fecha de corte (hoy - keepRawDataDays)
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - DATA_CONFIG.keepRawDataDays);
     const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
-    
+
     console.log(`🧹 [CLEANUP-AUTO] Eliminando lecturas_raw anteriores a: ${cutoffDateStr}`);
-    
+
     // 🔥 ELIMINAR TODAS LAS LECTURAS RAW DE DÍAS ANTERIORES
     const { error: deleteError, count } = await supabase
       .from("lecturas_raw")
       .delete()
       .lt("timestamp", `${cutoffDateStr}T23:59:59`);
-    
+
     if (deleteError) {
       console.error(`❌ [CLEANUP-AUTO] Error eliminando lecturas antiguas:`, deleteError.message);
     } else {
       console.log(`✅ [CLEANUP-AUTO] Limpieza completada. Eliminadas lecturas anteriores a ${cutoffDateStr}`);
     }
-    
+
     cleanupExecuted = true;
-    
+
   } catch (e) {
     console.error(`💥 [CLEANUP-AUTO] Error en limpieza:`, e.message);
   }
@@ -1135,7 +1135,7 @@ app.post("/api/force-generate-historical/:deviceId", async (req, res) => {
 function scheduleOptimizedTasks() {
   console.log("⏰ [SCHEDULER] Iniciando programación de tareas optimizadas...");
   console.log(`⏰ Hora actual del servidor: ${new Date().toString()}`);
-  
+
   // 🔥 Programar resumen diario a las 23:59 hora Perú
   const now = new Date();
   const targetTimeDaily = new Date(now);
@@ -1162,15 +1162,15 @@ function scheduleOptimizedTasks() {
   // 🔥 Programar limpieza automática a las 00:05 hora Perú
   const targetTimeCleanup = new Date(now);
   targetTimeCleanup.setHours(DATA_CONFIG.cleanupHour, DATA_CONFIG.cleanupMinute, 0, 0);
-  
+
   if (now > targetTimeCleanup) {
     targetTimeCleanup.setDate(targetTimeCleanup.getDate() + 1);
   }
-  
+
   const msUntilCleanup = targetTimeCleanup.getTime() - now.getTime();
-  
+
   console.log(`⏰ [SCHEDULER] Limpieza automática programada para: ${targetTimeCleanup.toLocaleTimeString()} (en ${Math.round(msUntilCleanup / 1000 / 60)} minutos)`);
-  
+
   setTimeout(() => {
     console.log("🧹 [SCHEDULER] Ejecutando limpieza automática...");
     cleanupOldRawData();
@@ -2423,7 +2423,7 @@ app.post("/api/force-cleanup", async (req, res) => {
   try {
     console.log(`🧹 [FORCE-CLEANUP] Ejecutando limpieza manual...`);
     await cleanupOldRawData();
-    
+
     res.json({
       success: true,
       message: "Limpieza ejecutada exitosamente",
@@ -2542,14 +2542,14 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
       const firstTimestamp = new Date(readings[0].timestamp);
       const lastTimestamp = new Date(readings[readings.length - 1].timestamp);
       const durationMs = lastTimestamp - firstTimestamp;
-      const durationHours = durationMs / (1000 * 60 * 60); 
+      const durationHours = durationMs / (1000 * 60 * 60);
       detailedAnalysis.timestamps.durationHours = parseFloat(durationHours.toFixed(4));
       detailedAnalysis.timestamps.durationHuman = formatDuration(durationMs);
       // 🔥 CONSUMO REAL (NO CALCULADO)
       const startEnergy = readings[0].energy;
       const endEnergy = readings[readings.length - 1].energy;
       const consumedKwh = Math.max(0, endEnergy - startEnergy);
-     
+
       detailedAnalysis.energy.startKwh = parseFloat(startEnergy.toFixed(6));
       detailedAnalysis.energy.endKwh = parseFloat(endEnergy.toFixed(6));
       detailedAnalysis.energy.consumedKwh = parseFloat(consumedKwh.toFixed(6));
@@ -2561,16 +2561,16 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
       const powers = readings.map(r => r.power);
       const voltages = readings.map(r => r.voltage);
       const currents = readings.map(r => r.current);
-     
+
       // Promedios
       detailedAnalysis.power.avg = parseFloat((powers.reduce((a, b) => a + b, 0) / powers.length).toFixed(2));
       detailedAnalysis.power.max = Math.max(...powers);
       detailedAnalysis.power.min = Math.min(...powers);
-     
+
       // Encontrar timestamp de potencia máxima (convertido a hora peruana)
       const maxPowerReading = readings.find(r => r.power === detailedAnalysis.power.max);
       detailedAnalysis.power.maxTimestamp = maxPowerReading ? getPeruTimestamp(new Date(maxPowerReading.timestamp)) : null;
-     
+
       // Distribución de potencia
       powers.forEach(power => {
         if (power <= 20) detailedAnalysis.power.distribution.veryLow++;
@@ -2579,7 +2579,7 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
         else if (power <= 500) detailedAnalysis.power.distribution.high++;
         else detailedAnalysis.power.distribution.veryHigh++;
       });
-     
+
       // Convertir a porcentajes
       Object.keys(detailedAnalysis.power.distribution).forEach(key => {
         detailedAnalysis.power.distribution[key] = parseFloat(
@@ -2589,7 +2589,7 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
       // 🔥 ANÁLISIS ELÉCTRICO
       detailedAnalysis.electrical.avgVoltage = parseFloat((voltages.reduce((a, b) => a + b, 0) / voltages.length).toFixed(1));
       detailedAnalysis.electrical.avgCurrent = parseFloat((currents.reduce((a, b) => a + b, 0) / currents.length).toFixed(3));
-     
+
       // Calcular estabilidad (desviación estándar relativa)
       const voltageStd = calculateStdDev(voltages);
       const currentStd = calculateStdDev(currents);
@@ -2614,17 +2614,17 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
         maxPower: hourlyAnalysis[hour].maxPower
       }));
       const overallAvgPower = hourlyAverages.reduce((sum, h) => sum + h.avgPower, 0) / hourlyAverages.length;
-     
+
       detailedAnalysis.timeAnalysis.activeHours = hourlyAverages
         .filter(h => h.avgPower > 10)
         .map(h => h.hour)
         .sort((a, b) => a - b);
-     
+
       detailedAnalysis.timeAnalysis.peakHours = hourlyAverages
         .filter(h => h.avgPower > overallAvgPower * 1.5)
         .map(h => h.hour)
         .sort((a, b) => a - b);
-     
+
       detailedAnalysis.timeAnalysis.offPeakHours = hourlyAverages
         .filter(h => h.avgPower < overallAvgPower * 0.3)
         .map(h => h.hour)
@@ -2671,8 +2671,8 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
         message: changePercent > 10
           ? `Consumo ${Math.abs(changePercent).toFixed(1)}% mayor que ayer`
           : changePercent < -10
-          ? `Consumo ${Math.abs(changePercent).toFixed(1)}% menor que ayer`
-          : "Consumo similar al día anterior"
+            ? `Consumo ${Math.abs(changePercent).toFixed(1)}% menor que ayer`
+            : "Consumo similar al día anterior"
       };
     }
     // 🔥 6. PREPARAR RESPUESTA CON TODOS LOS DATOS
@@ -2732,7 +2732,7 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
             raw_readings_used: readings.length
           })
           .eq("id", dayStats.id);
-       
+
         console.log(`✅ [DAILY-DETAILED] ${deviceId} - ${date}: Actualizado con datos precisos`);
       } catch (updateError) {
         console.error(`⚠️ Error actualizando datos precisos:`, updateError.message);
@@ -2754,11 +2754,11 @@ app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
 // 🔧 FUNCIÓN AUXILIAR: Formatear duración
 function formatDuration(ms) {
   if (!ms || ms <= 0) return "0 horas";
-  
+
   const hours = Math.floor(ms / (1000 * 60 * 60));
   const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
   const seconds = Math.floor((ms % (1000 * 60)) / 1000);
-  
+
   if (hours > 0) {
     return `${hours}h ${minutes}m`;
   } else if (minutes > 0) {
@@ -2779,7 +2779,7 @@ function calculateStdDev(values) {
 // 🔧 FUNCIÓN AUXILIAR: Generar recomendaciones personalizadas
 function generateRecommendations(analysis) {
   const recommendations = [];
-  
+
   if (!analysis.hasData) {
     recommendations.push({
       type: "info",
@@ -2923,23 +2923,23 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
     const energies = readings.map(r => parseFloat(r.energy || 0));
     const minEnergy = Math.min(...energies);
     const maxEnergy = Math.max(...energies);
-    
+
     // Encontrar los registros correspondientes
     const minReading = readings.find(r => parseFloat(r.energy) === minEnergy);
     const maxReading = readings.find(r => parseFloat(r.energy) === maxEnergy);
 
     // 🔥 CÁLCULOS PRECISOS
     const consumoKwh = Math.max(0, maxEnergy - minEnergy);
-    
+
     const firstTime = new Date(minReading.timestamp);
     const lastTime = new Date(maxReading.timestamp);
     const durationMs = lastTime - firstTime;
     const durationHours = durationMs / (1000 * 60 * 60);
-    
+
     const powers = readings.map(r => r.power || 0);
     const avgPower = powers.reduce((a, b) => a + b, 0) / powers.length;
     const maxPower = Math.max(...powers);
-    
+
     const cost = consumoKwh * 0.50;
 
     // 🔥 LOG DETALLADO
@@ -3082,7 +3082,7 @@ app.post("/api/recalculate-day/:deviceId", async (req, res) => {
 app.post("/api/recalculate-period/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { 
+    const {
       startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
       endDate = new Date().toISOString().split('T')[0]
     } = req.body;
@@ -3681,7 +3681,7 @@ async function calculateSolarRecommendation(deviceId) {
         roiMonths: roiMonths,
         annualSavings: parseFloat((monthlySavings * 12).toFixed(2))
       },
-      recommendation: panelsNeeded <= 2 ? 
+      recommendation: panelsNeeded <= 2 ?
         "Sistema pequeño recomendado para autoconsumo" :
         "Sistema mediano recomendado con posible inyección a red"
     };
@@ -3802,7 +3802,7 @@ app.post("/api/cleanup-old-data", async (req, res) => {
     const { daysToKeep = 1 } = req.body;
 
     await cleanupOldRawData();
-    
+
     res.json({
       success: true,
       message: `Limpieza ejecutada (conservando últimos ${daysToKeep} día)`,
@@ -3890,7 +3890,7 @@ app.get("/", (req, res) => {
       // 🔥 NUEVOS ENDPOINTS
       generateDailySummary: "POST /api/generate-daily-summary",
       forceCleanup: "POST /api/force-cleanup",
-       dailyAnalysisDetailed: "GET /api/daily-analysis-detailed/:deviceId", // ✅ NUEVO
+      dailyAnalysisDetailed: "GET /api/daily-analysis-detailed/:deviceId", // ✅ NUEVO
       solarRecommendation: "GET /api/solar-recommendation/:deviceId",
       simulateData: "POST /api/simulate-data",
       systemStats: "GET /api/system-stats"
@@ -4119,6 +4119,58 @@ app.get("/api/realtime-cost-forecast/:deviceId", async (req, res) => {
   }
 });
 
+// 📍 ENDPOINT: Obtener análisis histórico (REQUERIDO POR FLUTTER PARA MÚLTIPLES MESES)
+app.get("/api/historical-analysis/:deviceId", async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const { days = 90 } = req.query;
+
+    if (!deviceId) {
+      return res.status(400).json({
+        success: false,
+        error: "Falta deviceId"
+      });
+    }
+
+    console.log(`📊 [HISTORICAL] Solicitando ${days} días para ${deviceId}`);
+
+    // Calcular fecha de corte
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - parseInt(days));
+    const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
+
+    // Obtener los datos desde historicos_compactos a nivel diario
+    const { data: historicos, error } = await supabase
+      .from("historicos_compactos")
+      .select("*")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", "D") // La app de Flutter luego agrupa esto mensualmente
+      .gte("fecha_inicio", cutoffDateStr)
+      .order("fecha_inicio", { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      deviceId: deviceId,
+      historicos: historicos || [],
+      count: historicos?.length || 0,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (e) {
+    console.error("💥 /api/historical-analysis", e.message);
+    res.status(500).json({
+      success: false,
+      error: e.message
+    });
+  }
+});
+
+
+
 
 // 📍 ENDPOINT: Análisis comparativo REAL
 app.get("/api/comparative-analysis/:deviceId", async (req, res) => {
@@ -4306,14 +4358,14 @@ app.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Servidor corriendo en puerto ${PORT}`);
   console.log(`⏰ Hora peruana configurada: ${new Date().toString()}`);
   console.log(`📡 Sistema COMPLETO por SSID/WIFI con RECOLECCIÓN AUTOMÁTICA`);
-  
+
   // 🔥 INICIALIZAR REGISTROS DIARIOS
   await initializeDailyRecords();
-  
+
   // 🔥 EJECUTAR LIMPIEZA INICIAL DE DATOS ANTERIORES
   console.log("🧹 [INIT] Ejecutando limpieza inicial de datos antiguos...");
   await cleanupOldRawData();
-  
+
   console.log(`🔗 Endpoints principales:`);
   console.log(`   GET  /api/devices-by-wifi?wifiName=TU_WIFI`);
   console.log(`   POST /api/register-simple (deviceId, deviceName, wifiSsid)`);
