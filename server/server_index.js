@@ -4120,6 +4120,7 @@ app.get("/api/realtime-cost-forecast/:deviceId", async (req, res) => {
 });
 
 // 📍 ENDPOINT: Obtener análisis histórico (REQUERIDO POR FLUTTER PARA MÚLTIPLES MESES)
+// Soporta tanto registros diarios ('D') como horarios ('H') - agrupa 'H' por día automáticamente
 app.get("/api/historical-analysis/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
@@ -4139,24 +4140,143 @@ app.get("/api/historical-analysis/:deviceId", async (req, res) => {
     cutoffDate.setDate(cutoffDate.getDate() - parseInt(days));
     const cutoffDateStr = cutoffDate.toISOString().split('T')[0];
 
-    // Obtener los datos desde historicos_compactos a nivel diario
-    const { data: historicos, error } = await supabase
+    // ─── NIVEL 1: Buscar registros diarios ('D') ───
+    const { data: dailyRecords, error: dailyError } = await supabase
       .from("historicos_compactos")
       .select("*")
       .eq("device_id", deviceId)
-      .eq("tipo_periodo", "D") // La app de Flutter luego agrupa esto mensualmente
+      .eq("tipo_periodo", "D")
       .gte("fecha_inicio", cutoffDateStr)
       .order("fecha_inicio", { ascending: false });
 
-    if (error) {
-      throw error;
+    if (dailyError) {
+      throw dailyError;
     }
+
+    // Si hay registros diarios suficientes, devolverlos directamente
+    if (dailyRecords && dailyRecords.length > 5) {
+      console.log(`✅ [HISTORICAL] ${dailyRecords.length} registros diarios ('D') encontrados`);
+      return res.json({
+        success: true,
+        deviceId: deviceId,
+        historicos: dailyRecords,
+        count: dailyRecords.length,
+        source: 'daily',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // ─── NIVEL 2: Buscar registros horarios ('H') y agrupar por día ───
+    console.log(`📊 [HISTORICAL] Pocos registros 'D' (${dailyRecords?.length || 0}), buscando registros horarios 'H'...`);
+
+    const { data: hourlyRecords, error: hourlyError } = await supabase
+      .from("historicos_compactos")
+      .select("*")
+      .eq("device_id", deviceId)
+      .eq("tipo_periodo", "H")
+      .gte("fecha_inicio", cutoffDateStr)
+      .order("fecha_inicio", { ascending: true });
+
+    if (hourlyError) {
+      throw hourlyError;
+    }
+
+    if (!hourlyRecords || hourlyRecords.length === 0) {
+      // Si no hay 'H' tampoco, devolver los pocos 'D' que haya
+      console.log(`⚠️ [HISTORICAL] Sin registros 'H'. Devolviendo ${dailyRecords?.length || 0} registros 'D'`);
+      return res.json({
+        success: true,
+        deviceId: deviceId,
+        historicos: dailyRecords || [],
+        count: dailyRecords?.length || 0,
+        source: 'daily_sparse',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    console.log(`📊 [HISTORICAL] ${hourlyRecords.length} registros horarios encontrados, agrupando por día...`);
+
+    // ─── Agrupar registros 'H' por día ───
+    const byDay = {};
+    for (const record of hourlyRecords) {
+      // Extraer solo la fecha (YYYY-MM-DD) del campo fecha_inicio
+      const fechaStr = record.fecha_inicio?.toString() || '';
+      const dayKey = fechaStr.substring(0, 10); // '2026-01-15'
+
+      if (!dayKey || dayKey.length < 10) continue;
+
+      if (!byDay[dayKey]) {
+        byDay[dayKey] = [];
+      }
+      byDay[dayKey].push(record);
+    }
+
+    // ─── Convertir agrupaciones a registros diarios sintéticos ───
+    const aggregatedDaily = [];
+    for (const [dayKey, hours] of Object.entries(byDay)) {
+      const totalConsumo = hours.reduce((sum, h) => sum + (h.consumo_total_kwh || 0), 0);
+      const totalCosto = hours.reduce((sum, h) => sum + (h.costo_estimado || 0), 0);
+      const maxPico = Math.max(...hours.map(h => h.potencia_pico_w || 0));
+      const avgPromedio = hours.reduce((sum, h) => sum + (h.potencia_promedio_w || 0), 0) / hours.length;
+      const totalHoras = hours.reduce((sum, h) => sum + (h.horas_uso_estimadas || 0), 0);
+
+      // Determinar eficiencia
+      let eficiencia = 'B'; // Buena por defecto
+      if (avgPromedio > 150) eficiencia = 'A'; // Alto consumo
+      else if (avgPromedio > 100) eficiencia = 'M'; // Medio
+      else if (avgPromedio > 50) eficiencia = 'B'; // Bajo
+      else eficiencia = 'C'; // Muy bajo
+
+      aggregatedDaily.push({
+        device_id: deviceId,
+        tipo_periodo: 'D',
+        fecha_inicio: dayKey,
+        consumo_total_kwh: parseFloat(totalConsumo.toFixed(6)),
+        potencia_pico_w: maxPico,
+        potencia_promedio_w: parseFloat(avgPromedio.toFixed(2)),
+        horas_uso_estimadas: parseFloat(totalHoras.toFixed(1)),
+        costo_estimado: parseFloat(totalCosto.toFixed(4)),
+        dias_alto_consumo: avgPromedio > 100 ? 1 : 0,
+        eficiencia_categoria: eficiencia,
+        has_data: true,
+        raw_readings_count: hours.reduce((sum, h) => sum + (h.raw_readings_count || 0), 0),
+        auto_generated: true,
+        aggregated_from_hourly: true, // Flag para indicar origen
+        hourly_records_count: hours.length
+      });
+    }
+
+    // Ordenar por fecha descendente (más reciente primero)
+    aggregatedDaily.sort((a, b) => b.fecha_inicio.localeCompare(a.fecha_inicio));
+
+    // Combinar con los pocos registros 'D' que puedan existir (sin duplicar días)
+    const existingDayKeys = new Set(aggregatedDaily.map(d => d.fecha_inicio));
+    const combined = [...aggregatedDaily];
+
+    if (dailyRecords && dailyRecords.length > 0) {
+      for (const dr of dailyRecords) {
+        const drDay = dr.fecha_inicio?.toString().substring(0, 10);
+        if (!existingDayKeys.has(drDay)) {
+          combined.push(dr);
+        }
+      }
+      combined.sort((a, b) => {
+        const aDate = a.fecha_inicio?.toString().substring(0, 10) || '';
+        const bDate = b.fecha_inicio?.toString().substring(0, 10) || '';
+        return bDate.localeCompare(aDate);
+      });
+    }
+
+    console.log(`✅ [HISTORICAL] ${combined.length} registros diarios generados (${aggregatedDaily.length} desde 'H', ${dailyRecords?.length || 0} originales 'D')`);
 
     res.json({
       success: true,
       deviceId: deviceId,
-      historicos: historicos || [],
-      count: historicos?.length || 0,
+      historicos: combined,
+      count: combined.length,
+      source: 'hourly_aggregated',
+      hourlyRecordsProcessed: hourlyRecords.length,
+      daysGenerated: aggregatedDaily.length,
       timestamp: new Date().toISOString()
     });
 
