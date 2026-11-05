@@ -1,14 +1,18 @@
 // server_index.js - VERSIÓN CORREGIDA CON HORA PERUANA Y LIMPIEZA AUTOMÁTICA
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
+const { getPeruTimestamp, getPeruDateStr } = require("./lib/peru-time");
 
 // ✅ CONFIGURACIÓN DE HORA PERUANA (UTC-5)
 process.env.TZ = 'America/Lima';
 console.log(`⏰ Configurando hora peruana: ${new Date().toString()}`);
 
 // ✅ CORRECTO - Usa variables de entorno
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://rrqxllucpihrcxeaossl.supabase.co";
+const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  throw new Error("Configure SUPABASE_URL and SUPABASE_SERVICE_KEY before starting the server.");
+}
 
 // Inicializar Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
@@ -36,9 +40,6 @@ const DATA_CONFIG = {
   cleanupMinute: 5,
 };
 
-const getPeruDateStr = (input = new Date()) => {
-  return getPeruTimestamp(input).split('T')[0];
-};
 
 // Contadores por dispositivo para controlar frecuencia
 const deviceCounters = {};
@@ -236,19 +237,11 @@ async function createDeviceInSupabase(deviceData) {
     return null;
   }
 }
-const getPeruTimestamp = (input = new Date()) => {
-  const date = input instanceof Date ? input : new Date(input);
-  // Ajuste manual para UTC-5 (Perú sin DST)
-  const offsetMs = -5 * 60 * 60 * 1000; // -5 horas en ms
-  const localDate = new Date(date.getTime() + offsetMs);
-  // Formatear como ISO con offset fijo -05:00
-  return localDate.toISOString().slice(0, -1) + '-05:00';
-};
 
 // 🔥 NUEVA FUNCIÓN: Obtener estadísticas actuales del día
 async function getCurrentDayStats(deviceId) {
   try {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getPeruDateStr();
 
     const { data: dayStats, error } = await supabase
       .from("historicos_compactos")
@@ -563,7 +556,7 @@ async function saveToLecturasRawOptimized(deviceId, data, finalEnergy, timestamp
 app.get("/api/today-stats/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getPeruDateStr();
 
     const { data: dayStats, error } = await supabase
       .from("historicos_compactos")
@@ -1188,7 +1181,7 @@ function scheduleOptimizedTasks() {
 app.get("/api/day-status/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const today = new Date().toISOString().split('T')[0];
+    const today = getPeruDateStr();
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayStr = yesterday.toISOString().split('T')[0];
@@ -2442,7 +2435,7 @@ app.post("/api/force-cleanup", async (req, res) => {
 app.get("/api/daily-analysis-detailed/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { date = new Date().toISOString().split('T')[0], includeRawData = "false" } = req.query;
+    const { date = getPeruDateStr(), includeRawData = "false" } = req.query;
     if (!deviceId) {
       return res.status(400).json({
         success: false,
@@ -2870,7 +2863,7 @@ function generateRecommendations(analysis) {
 app.post("/api/recalculate-day/:deviceId", async (req, res) => {
   try {
     const { deviceId } = req.params;
-    const { date = new Date().toISOString().split('T')[0] } = req.body;
+    const { date = getPeruDateStr() } = req.body;
 
     if (!deviceId) {
       return res.status(400).json({
@@ -3084,7 +3077,7 @@ app.post("/api/recalculate-period/:deviceId", async (req, res) => {
     const { deviceId } = req.params;
     const {
       startDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-      endDate = new Date().toISOString().split('T')[0]
+      endDate = getPeruDateStr()
     } = req.body;
 
     if (!deviceId) {
@@ -4415,7 +4408,7 @@ app.get("/api/comparative-analysis/:deviceId", async (req, res) => {
 
 async function initializeDailyRecords() {
   try {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = getPeruDateStr();
     console.log(`📝 [INIT] Verificando registros para hoy: ${todayStr}`);
     // Obtener todos los dispositivos registrados
     const { data: devices, error } = await supabase
