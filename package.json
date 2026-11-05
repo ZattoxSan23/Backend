@@ -1,10 +1,12 @@
 {
   "name": "servidor",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Servicio de telemetría ESP32/PZEM con persistencia e históricos en Supabase",
+  "main": "server/server_index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server/server_index.js",
+    "check": "node --check server/server_index.js",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
